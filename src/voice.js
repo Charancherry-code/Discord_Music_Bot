@@ -30,10 +30,8 @@ export class VoiceManager {
   #joinTimes = [];
   #wired = new WeakSet();
   #syncing = false;
+  #resumeOnRejoin = false;
   #pendingSync = false;
-
-  /** Called after the bot joins your channel with an empty queue (loads playlist.txt). */
-  onOwnerJoinEmpty = null;
 
   constructor(client, session, settings) {
     this.client = client;
@@ -139,24 +137,21 @@ export class VoiceManager {
     }
 
     if (!this.settings.data.follow) return;
-    if (botChannel === ownerChannel) {
-      if (this.connection?.state.status === VoiceConnectionStatus.Ready) await this.#startPlayback(true);
-      return;
-    }
+    if (botChannel === ownerChannel) return;
 
     const channel = this.guild.channels.cache.get(ownerChannel);
     if (!channel?.isVoiceBased()) return;
-    await this.join(channel);
-    await this.#startPlayback(true);
-  }
 
-  /** Starts the session; if it's empty and this is your channel, loads playlist.txt first. */
-  async #startPlayback(forOwner) {
-    if (!this.session.hasPending && this.session.isIdle && forOwner && this.onOwnerJoinEmpty) {
-      this.session.textChannelId = this.channelId; // voice channel's built-in text chat
-      await this.onOwnerJoinEmpty();
+    // Following you never starts music by itself. Music only keeps going if it was
+    // already playing (you switched channels, or the connection dropped mid-song).
+    const keepPlaying = this.session.active || this.#resumeOnRejoin;
+    this.#resumeOnRejoin = false;
+    await this.join(channel);
+    if (keepPlaying) {
+      this.session.start();
+    } else if (!this.session.textChannelId) {
+      this.session.textChannelId = channel.id; // so a later cplay card has somewhere to go
     }
-    this.session.start();
     this.#scheduleOccupancyCheck();
   }
 
@@ -263,6 +258,7 @@ export class VoiceManager {
         ]);
       } catch {
         log.warn('Voice connection lost.');
+        this.#resumeOnRejoin = this.session.active; // a network blip shouldn't stop the music
         this.leave();
         if (this.settings.data.follow && this.ownerInVoice()) this.scheduleOwnerSync(2_000);
       }

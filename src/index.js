@@ -13,7 +13,7 @@ import { Resolver } from './resolver.js';
 import { loadDefaultPlaylist } from './sources.js';
 import { JsonStore } from './store.js';
 import { VoiceManager } from './voice.js';
-import { checkFfmpeg } from './audio.js';
+import { checkFfmpeg, raisePriority } from './audio.js';
 import { ensureYtDlp } from './ytdlp-install.js';
 import { updateYtDlp } from './ytdlp.js';
 
@@ -67,11 +67,6 @@ session.getAudioOptions = () => {
   const name = PROFILES[settings.data.soundProfile] ? settings.data.soundProfile : DEFAULT_PROFILE;
   const channel = voice.channelId ? client.channels.cache.get(voice.channelId) : null;
   return { profile: name, filters: getProfile(name).filters, bitrate: encodeBitrate(channel?.bitrate) };
-};
-
-voice.onOwnerJoinEmpty = async () => {
-  const tracks = await loadDefaultPlaylist();
-  if (tracks.length) session.add(tracks);
 };
 
 // ---------- resume after restart ----------
@@ -216,6 +211,7 @@ function acquireSingleInstanceLock() {
 
 async function main() {
   acquireSingleInstanceLock();
+  raisePriority(); // audio timing is sensitive; keep it ahead of games and browsers
   log.debug(`\n${generateDependencyReport()}`);
 
   try {

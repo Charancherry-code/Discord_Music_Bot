@@ -16,10 +16,15 @@ function baseArgs() {
     // YouTube now requires a JS runtime to solve its challenges; reuse the Node binary running this bot.
     '--js-runtimes',
     `node:${process.execPath}`,
+    // A stalled download is retried quickly instead of hanging (the buffer covers the gap).
     '--socket-timeout',
-    '15',
+    '10',
     '--retries',
-    '3',
+    '10',
+    '--fragment-retries',
+    '10',
+    '--retry-sleep',
+    '1',
   ];
   if (config.cookiesFile) {
     if (fs.existsSync(config.cookiesFile)) {

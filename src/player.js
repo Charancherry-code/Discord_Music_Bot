@@ -4,7 +4,6 @@ import { AudioPlayerStatus, createAudioPlayer, NoSubscriberBehavior } from '@dis
 import { createTrackResource } from './audio.js';
 import { log } from './logger.js';
 import { shuffleInPlace } from './sources.js';
-import { fetchEntries } from './ytdlp.js';
 
 const MAX_CONSECUTIVE_FAILURES = 5;
 const FAILURE_BACKOFF_MS = 60_000;
@@ -46,6 +45,9 @@ export class MusicSession extends EventEmitter {
   #seekBase = 0; // seconds: where the current resource started inside the track
   #resumeAt = 0; // seconds: where to start the next load (resume after leave/restart)
   #autoPaused = false;
+  #prefetch = null; // { track, key, controller, promise } for the next song
+  #prefetchTimer = null;
+  #currentDownloaded = false;
 
   constructor(resolver) {
     super();
@@ -63,6 +65,11 @@ export class MusicSession extends EventEmitter {
       if (newState.status === AudioPlayerStatus.Idle && oldState.status !== AudioPlayerStatus.Idle) {
         this.#onTrackEnd(oldState.resource);
       }
+    });
+
+    // Queue edits (add, move, shuffle, loop...) can change which song is next: re-check the preload.
+    this.on('change', () => {
+      if (this.nowPlaying) this.#schedulePrefetch();
     });
 
     // Stutter detector: "missed frames" means audio data wasn't ready in time (slow download or busy CPU).
@@ -201,6 +208,7 @@ export class MusicSession extends EventEmitter {
     this.active = false;
     this.#autoPaused = false;
     this.#pendingJump = null;
+    this.#dropPrefetch();
     this.#clearNextTimer();
     this.#loading?.abort();
     this.#loading = null;
@@ -217,6 +225,7 @@ export class MusicSession extends EventEmitter {
     this.index = 0;
     this.#resumeAt = 0;
     this.#pendingJump = null;
+    this.#dropPrefetch();
     this.#clearNextTimer();
     this.#loading?.abort();
     this.#loading = null;
@@ -308,7 +317,7 @@ export class MusicSession extends EventEmitter {
 
   snapshot() {
     return {
-      tracks: this.tracks.map(({ needsInfo, ...t }) => (needsInfo ? { ...t, needsInfo } : t)),
+      tracks: this.tracks,
       index: this.index,
       position: Math.floor(this.positionSec),
       loop: this.loop,
@@ -401,26 +410,75 @@ export class MusicSession extends EventEmitter {
     this.index -= drop;
   }
 
-  /** Fills in URL/title for playlist.txt entries right before they play. */
+  /**
+   * Turns playlist.txt search phrases into a URL (cached after the first time).
+   * Links need nothing here: the streaming yt-dlp run fills in title, artist and length.
+   */
   async #prepare(track, signal) {
-    if (track.query && !track.url) {
-      const info = await this.resolver.resolve(track.query, signal);
-      Object.assign(track, {
-        title: info.title,
-        url: info.url,
-        duration: info.duration ?? null,
-        thumbnail: info.thumbnail ?? null,
-        author: info.author ?? null,
-      });
-    } else if (track.needsInfo) {
-      delete track.needsInfo;
-      try {
-        const [info] = await fetchEntries(track.url, { limit: 1, signal });
-        if (info) Object.assign(track, { title: info.title, duration: info.duration, thumbnail: info.thumbnail, author: info.author });
-      } catch {
-        // Title lookup is cosmetic; the stream itself may still work.
-      }
+    if (!track.query || track.url) return;
+    const info = await this.resolver.resolve(track.query, signal);
+    Object.assign(track, {
+      title: info.title,
+      url: info.url,
+      duration: info.duration ?? null,
+      thumbnail: info.thumbnail ?? null,
+      author: info.author ?? null,
+    });
+  }
+
+  // ---------- preloading the next song ----------
+
+  /** Starts loading the next song a few seconds after the current one starts. */
+  #schedulePrefetch(delayMs = 3_000) {
+    clearTimeout(this.#prefetchTimer);
+    this.#prefetchTimer = setTimeout(() => this.#startPrefetch(), delayMs);
+    this.#prefetchTimer.unref();
+  }
+
+  #startPrefetch() {
+    if (!this.active || !this.nowPlaying || this.loop === 'song') return;
+    // Never let the next song's download compete with the current one on a slow connection.
+    if (!this.#currentDownloaded) return;
+    const next = this.tracks[this.index + 1] ?? (this.loop === 'queue' ? this.tracks[0] : null);
+    if (!next || next.live || next === this.nowPlaying) return;
+
+    const audioOptions = this.getAudioOptions();
+    const key = JSON.stringify(audioOptions);
+    if (this.#prefetch?.track === next && this.#prefetch.key === key) return;
+    this.#dropPrefetch();
+
+    const controller = new AbortController();
+    const entry = { track: next, key, controller, promise: null };
+    entry.promise = (async () => {
+      await this.#prepare(next, controller.signal);
+      return createTrackResource(next, { ...audioOptions, signal: controller.signal });
+    })();
+    entry.promise.catch((err) => {
+      if (!controller.signal.aborted) log.debug(`Preload of "${next.title}" failed: ${err.message}`);
+    });
+    this.#prefetch = entry;
+    log.debug(`Preloading "${next.title}".`);
+  }
+
+  /** Returns the preload for `track` if it matches, otherwise discards any preload. */
+  #takePrefetch(track, audioOptions, seekSec) {
+    const p = this.#prefetch;
+    if (!p) return null;
+    if (p.track !== track || seekSec > 0 || p.key !== JSON.stringify(audioOptions)) {
+      this.#dropPrefetch();
+      return null;
     }
+    this.#prefetch = null;
+    return p;
+  }
+
+  #dropPrefetch() {
+    clearTimeout(this.#prefetchTimer);
+    const p = this.#prefetch;
+    this.#prefetch = null;
+    if (!p) return;
+    p.controller.abort();
+    p.promise.then((loaded) => loaded.cleanup(), () => {});
   }
 
   async #playCurrent() {
@@ -453,12 +511,23 @@ export class MusicSession extends EventEmitter {
       const track = this.tracks[this.index];
       const seekSec = this.#resumeAt;
       this.#resumeAt = 0;
-      await this.#prepare(track, signal);
-      signal.throwIfAborted();
-
       const loadStarted = Date.now();
       const audioOptions = this.getAudioOptions();
-      const loaded = await createTrackResource(track, { ...audioOptions, seekSec, signal });
+
+      // Use the preloaded copy of this song if there is one (skip feels instant).
+      let loaded = null;
+      const pre = this.#takePrefetch(track, audioOptions, seekSec);
+      if (pre) {
+        signal.addEventListener('abort', () => pre.controller.abort(), { once: true });
+        loaded = await pre.promise.catch(() => null);
+        if (loaded) log.debug(`Using preloaded "${track.title}".`);
+      }
+      if (!loaded) {
+        signal.throwIfAborted();
+        await this.#prepare(track, signal);
+        signal.throwIfAborted();
+        loaded = await createTrackResource(track, { ...audioOptions, seekSec, signal });
+      }
       if (signal.aborted || !this.active) {
         loaded.cleanup();
         return;
@@ -471,6 +540,17 @@ export class MusicSession extends EventEmitter {
       log.info(`Now playing: ${track.title}${loaded.passthrough ? '' : ' (ffmpeg)'}`);
       this.emit('trackStart', track);
       this.emit('change');
+
+      // Preload the next song only after this one is fully downloaded (or after 2 minutes at most).
+      this.#currentDownloaded = false;
+      const current = this.#current;
+      const waitLimit = new Promise((resolve) => setTimeout(resolve, 120_000).unref());
+      Promise.race([loaded.downloadDone ?? Promise.resolve(), waitLimit]).then(() => {
+        if (this.#current !== current) return;
+        this.#currentDownloaded = true;
+        log.debug(`"${track.title}" fully downloaded.`);
+        this.#schedulePrefetch(1_000);
+      });
     } catch (err) {
       if (signal.aborted) return;
       this.#loading = null;

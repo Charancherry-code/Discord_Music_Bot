@@ -58,7 +58,7 @@ export async function resolveInput(input, requester, signal) {
 }
 
 function lineToTrack(line) {
-  if (URL_RE.test(line)) return { title: line, url: line, needsInfo: true, requesterId: null, isDefault: true };
+  if (URL_RE.test(line)) return { title: line, url: line, requesterId: null, isDefault: true };
 
   // Local files are only allowed from playlist.txt (which only the host owner can edit).
   const local = path.resolve(ROOT_DIR, line);

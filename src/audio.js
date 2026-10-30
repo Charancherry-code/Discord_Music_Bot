@@ -18,6 +18,7 @@ async function applyInfoFile(track, infoFile) {
   try {
     const info = parseInfoLine((await fsp.readFile(infoFile, 'utf8')).trim().split(/\r?\n/)[0]);
     if (!info) return;
+    if (/^https?:\/\//i.test(track.title ?? '') && info.title) track.title = info.title; // link -> real title
     track.duration ??= info.duration;
     track.author ??= info.author;
     track.thumbnail ??= info.thumbnail;
@@ -31,8 +32,9 @@ async function applyInfoFile(track, infoFile) {
 
 // Slow connections plus YouTube's JS challenge can take a while before the first audio byte.
 const FIRST_BYTE_TIMEOUT_MS = 75_000;
-// Wait for this much audio before playing (about 20 s at 160 kbps), so short network dips don't stutter.
-const PREBUFFER_BYTES = 384 * 1024;
+// Wait for this much audio before playing (about 6 s at 160 kbps). Downloading keeps running ahead
+// of playback after that (several times faster than real time), so the buffer keeps growing.
+const PREBUFFER_BYTES = 128 * 1024;
 // Let yt-dlp keep downloading ahead of playback, up to about a whole song.
 const DOWNLOAD_AHEAD_BYTES = 16 * 1024 * 1024;
 // FFMPEG_PATH lets you use a system ffmpeg if the bundled ffmpeg-static binary doesn't work on your host.
@@ -75,10 +77,6 @@ export function checkFfmpeg(filters) {
   });
 }
 
-export function ffmpegAvailable() {
-  return ffmpegOk;
-}
-
 /**
  * Detects an Opus file from its first bytes. Used instead of demuxProbe, which puts the bytes
  * it read back at the END of a stream that already has data buffered, corrupting the start.
@@ -88,6 +86,15 @@ function sniffOpus(head) {
   if (head.length >= 4 && head.readUInt32BE(0) === 0x1a45dfa3 && text.includes('A_OPUS')) return StreamType.WebmOpus;
   if (text.startsWith('OggS') && text.includes('OpusHead')) return StreamType.OggOpus;
   return null;
+}
+
+/** Runs a process above normal CPU priority so games or other apps can't starve the audio. */
+export function raisePriority(pid) {
+  try {
+    os.setPriority(pid ?? 0, os.constants.priority.PRIORITY_ABOVE_NORMAL);
+  } catch {
+    // Not allowed on this system; normal priority still works.
+  }
 }
 
 function kill(proc) {
@@ -203,6 +210,7 @@ function transcode({ input, file, seekSec = 0, filters = null, bitrate = 160_000
     throw new Error(`could not start ffmpeg (${err.code ?? err.message}); run "npm rebuild ffmpeg-static" or set FFMPEG_PATH`);
   }
   ff.on('error', (err) => log.debug('ffmpeg process error:', err.message));
+  raisePriority(ff.pid);
   ff.stdout.on('error', () => {});
   ff.stderr.setEncoding('utf8');
   ff.stderr.on('data', (chunk) => log.debug('ffmpeg:', chunk.trim()));
@@ -224,8 +232,11 @@ export async function createTrackResource(track, { seekSec = 0, filters = null, 
   const onAbort = () => cleanup();
   signal?.addEventListener('abort', onAbort, { once: true });
 
+  // Resolves when the whole song has been downloaded (the next song's preload waits for this).
+  let downloadDone = Promise.resolve();
   const finalize = (stream, inputType, passthrough) => ({
     resource: createAudioResource(stream, { inputType, metadata: track }),
+    downloadDone,
     cleanup,
     passthrough,
   });
@@ -258,6 +269,7 @@ export async function createTrackResource(track, { seekSec = 0, filters = null, 
       const infoFile = needsInfo ? path.join(os.tmpdir(), `smb-${randomUUID()}.json`) : null;
       const child = spawnAudioStream(track.url, { infoFile });
       procs.push(child);
+      downloadDone = new Promise((resolve) => child.once('exit', resolve));
       child.once('exit', (code) => {
         if (code) log.debug(`yt-dlp exited with code ${code} for ${track.url}`);
       });
