@@ -1,0 +1,5 @@
+# One song per line: a search phrase, a URL, or a path to a local audio file.
+# Lines starting with # are ignored. Edits are picked up when the playlist loops or on /reload.
+Daft Punk - One More Time
+Arijit Singh - Tum Hi Ho
+https://www.youtube.com/watch?v=dQw4w9WgXcQ
