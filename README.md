@@ -2,7 +2,24 @@
 
 A private, Jockie-style music bot for one server. It follows you between voice channels, plays full-quality audio, and only you and the people you approve can control it.
 
-**Status:** Stage 1 of 4 is done. That covers playback, the queue, Now Playing buttons, permissions, follow mode and resume after restart. Spotify, autoplay, effects, lyrics and stats come in later stages.
+**Status:** Stages 1 and 2 of 4 are done: playback, queue, buttons, permissions, follow mode, resume after restart, sound profiles, Spotify links, smart autoplay and vibe radio. Effects, lyrics and stats come next.
+
+## Spotify links
+
+`cplay` accepts Spotify **track, album, playlist and artist** links (also `spotify.link` short links). No Spotify account or API key is needed.
+
+- Spotify doesn't allow streaming its audio, so each song plays from **YouTube Music** by searching "artist - title". The card keeps Spotify's title, artist and length.
+- The search happens right before each song plays (and is cached), so a 100-song playlist is added instantly.
+- Spotify's public embed shows up to about 100 songs, so bigger playlists are cut there. Private playlists can't be read.
+
+## Autoplay
+
+When the last queued song starts playing, autoplay picks a similar song from **YouTube's Mix** for it and queues it, so it preloads and plays without a gap.
+
+- Skips songs played in the last 50, other uploads of the same song, and compilations, jukeboxes, covers, slowed/8D edits and anything shorter than 90 s or longer than 10 min.
+- **Learns:** skip an autoplay pick within 30 s and that artist is avoided for 2 hours.
+- Songs people request always play before autoplay picks (marked 🎲 in `cqueue`).
+- With loop on, autoplay waits. With autoplay off, the queue falls back to `playlist.txt` in your channel.
 
 ## Rules
 
@@ -37,6 +54,8 @@ Prefix is `c`. Aliases are in brackets.
 | `cclear` | Clear Up Next |
 | `cshuffle` [`csh`] | Shuffle Up Next |
 | `cloop [off/song/queue]` [`crepeat`] | Set the loop mode. With nothing after it, cycles through the modes. |
+| `cautoplay [on/off]` [`cap`, `cauto`] | Keep playing similar songs when the queue runs out (on by default). The 🎲 button on the card toggles it too. |
+| `cvibe <mood>` [`cradio`, `cmood`] | Endless radio: chill, romantic, sad, party, gym, punjabi, telugu, tamil, english, focus. `cvibe` alone lists them. |
 | `csound [pure/hifi/bass/vocal]` [`cprofile`, `ceq`] | Pick the sound profile. It applies right away, from the same spot in the song. |
 | `cping` [`clatency`, `cnet`] | Network check: Discord gateway, message round trip, voice ping and how long the last song took to start |
 | `chelp` [`ccommands`] | List commands |

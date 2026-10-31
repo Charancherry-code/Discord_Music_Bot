@@ -25,6 +25,8 @@ export class MusicSession extends EventEmitter {
   tracks = [];
   index = 0;
   loop = 'off';
+  /** When the queue runs out, keep playing similar songs (managed by autoplay.js). */
+  autoplay = false;
   /** True while the bot is in voice and should be playing. */
   active = false;
   /** Where the Now Playing card goes. */
@@ -142,11 +144,13 @@ export class MusicSession extends EventEmitter {
     const items = newTracks.slice(0, room);
     if (!items.length) return { added: 0, position: -1 };
 
+    // Requested songs jump ahead of filler (playlist.txt and autoplay picks).
+    const isFiller = (t) => t.isDefault || t.autoplay;
     const finished = this.index >= this.tracks.length;
     let insertAt = this.tracks.length;
-    if (!finished && !items[0].isDefault) {
-      const firstDefault = this.tracks.findIndex((t, i) => i > this.index && t.isDefault);
-      if (firstDefault !== -1) insertAt = firstDefault;
+    if (!finished && !isFiller(items[0])) {
+      const firstFiller = this.tracks.findIndex((t, i) => i > this.index && isFiller(t));
+      if (firstFiller !== -1) insertAt = firstFiller;
     }
     this.tracks.splice(insertAt, 0, ...items);
 
@@ -241,6 +245,7 @@ export class MusicSession extends EventEmitter {
 
   skip() {
     if (this.isIdle) return false;
+    if (this.nowPlaying) this.emit('skip', this.nowPlaying, this.positionSec); // autoplay learns from this
     if (this.#nextTimer && !this.#loading && this.audio.state.status === AudioPlayerStatus.Idle) {
       // Already moved on and waiting (e.g. failure backoff): play that next track right away.
       this.#failures = 0;
@@ -417,6 +422,12 @@ export class MusicSession extends EventEmitter {
   async #prepare(track, signal) {
     if (!track.query || track.url) return;
     const info = await this.resolver.resolve(track.query, signal);
+    if (track.source === 'spotify') {
+      // Keep Spotify's clean title/artist/length; only borrow the playable URL (and a cover if missing).
+      track.url = info.url;
+      track.thumbnail ??= info.thumbnail ?? null;
+      return;
+    }
     Object.assign(track, {
       title: info.title,
       url: info.url,

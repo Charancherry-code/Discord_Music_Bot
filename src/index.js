@@ -1,5 +1,6 @@
 import { config } from './config.js';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { Client, Events, GatewayIntentBits, Options } from 'discord.js';
 import { generateDependencyReport } from '@discordjs/voice';
@@ -14,8 +15,13 @@ import { loadDefaultPlaylist } from './sources.js';
 import { JsonStore } from './store.js';
 import { VoiceManager } from './voice.js';
 import { checkFfmpeg, raisePriority } from './audio.js';
+import { Autoplay } from './autoplay.js';
 import { ensureYtDlp } from './ytdlp-install.js';
 import { updateYtDlp } from './ytdlp.js';
+
+// Node tries IPv6 and IPv4 in parallel, giving each only 250 ms by default. On slow networks
+// that makes connections fail ("fetch failed"); 1 s is still fast but much more reliable.
+net.setDefaultAutoSelectFamilyAttemptTimeout(1000);
 
 // Never let a stray error take the bot (and its voice connection) down.
 process.on('unhandledRejection', (err) => log.error('Unhandled rejection:', err));
@@ -56,8 +62,15 @@ const voice = new VoiceManager(client, session, settings);
 const card = new NowPlayingCard(client, session);
 let commands = null;
 
-// When the queue runs out while you're listening, fall back to playlist.txt (re-read each time).
+const autoplay = new Autoplay(session, settings);
+
+// When the queue runs out: similar songs if autoplay is on, otherwise playlist.txt
+// (only in your channel, re-read each time).
 session.onQueueEnd = async () => {
+  if (session.autoplay && session.loop === 'off') {
+    const picks = await autoplay.next();
+    if (picks.length) return picks;
+  }
   const botChannel = voice.channelId;
   return botChannel && botChannel === voice.ownerChannelId() ? loadDefaultPlaylist() : [];
 };
@@ -233,7 +246,8 @@ async function main() {
         'Fix: run "npm rebuild ffmpeg-static", or install ffmpeg and set FFMPEG_PATH in .env.',
     );
   }
-  commands = new CommandHandler({ session, voice, perms: new Permissions(permissionsStore), settings, card });
+  session.autoplay = settings.data.autoplay !== false; // on unless you turned it off
+  commands = new CommandHandler({ session, voice, perms: new Permissions(permissionsStore), settings, card, autoplay });
 
   try {
     await client.login(config.token);

@@ -6,6 +6,7 @@ import { log } from './logger.js';
 import { COLORS } from './nowplaying.js';
 import { LOOP_MODES } from './player.js';
 import { PROFILES } from './profiles.js';
+import { VIBES } from './autoplay.js';
 import { loadDefaultPlaylist, makeTrack, resolveInput, UserError } from './sources.js';
 import { searchTracks } from './ytdlp.js';
 
@@ -23,7 +24,8 @@ function parsePositive(text) {
 export class CommandHandler {
   #lookup = new Map();
 
-  constructor({ session, voice, perms, settings, card }) {
+  constructor({ session, voice, perms, settings, card, autoplay }) {
+    this.autoplay = autoplay;
     this.session = session;
     this.voice = voice;
     this.perms = perms;
@@ -154,6 +156,9 @@ export class CommandHandler {
         case 'shuffle':
           s.shuffle();
           break;
+        case 'autoplay':
+          this.autoplay.setEnabled(!s.autoplay);
+          break;
         default:
           return;
       }
@@ -175,7 +180,7 @@ export class CommandHandler {
 
     const lines = upcoming
       .slice(p * QUEUE_PAGE_SIZE, (p + 1) * QUEUE_PAGE_SIZE)
-      .map((t, i) => `\`${p * QUEUE_PAGE_SIZE + i + 1}.\` ${trackLabel(t, 60)} \`${formatDuration(t.duration)}\`${t.isDefault ? ' 📄' : ''}`);
+      .map((t, i) => `\`${p * QUEUE_PAGE_SIZE + i + 1}.\` ${trackLabel(t, 60)} \`${formatDuration(t.duration)}\`${t.autoplay ? ' 🎲' : t.isDefault ? ' 📄' : ''}`);
 
     const total = upcoming.reduce((sum, t) => sum + (t.duration ?? 0), 0);
     return new EmbedBuilder()
@@ -483,6 +488,50 @@ export class CommandHandler {
           const applied = s.reapplyAudio();
           const p = PROFILES[wanted];
           return ctx.reply(`${p.emoji} Sound profile: **${p.label}**. ${applied ? 'Applied now.' : 'Applies to the next song.'}`, COLORS.playing);
+        },
+      },
+      {
+        name: 'autoplay',
+        aliases: ['ap', 'auto'],
+        usage: 'autoplay [on | off]',
+        description: 'When the queue runs out, keep playing similar songs. With nothing after it, toggles.',
+        sameChannel: true,
+        run: (ctx) => {
+          const wanted = ctx.args[0]?.toLowerCase();
+          if (wanted && !['on', 'off'].includes(wanted)) throw new UserError('Usage: `cautoplay on` or `cautoplay off`.');
+          const on = this.autoplay.setEnabled(wanted ? wanted === 'on' : !s.autoplay);
+          return ctx.reply(
+            on ? '🎲 Autoplay **on**. Similar songs play when the queue runs out.' : '⏹ Autoplay **off**. Picks already queued were removed.',
+            on ? COLORS.playing : COLORS.idle,
+          );
+        },
+      },
+      {
+        name: 'vibe',
+        aliases: ['radio', 'mood'],
+        usage: 'vibe <mood>',
+        description: `Endless radio in a mood: ${Object.keys(VIBES).join(', ')}.`,
+        run: async (ctx) => {
+          const name = ctx.args[0]?.toLowerCase();
+          if (!name || !VIBES[name]) {
+            const list = Object.entries(VIBES).map(([k, x]) => `${x.emoji} \`${config.prefix}vibe ${k}\``).join('\n');
+            return ctx.reply(`📻 **Pick a vibe**\n\n${list}`);
+          }
+          await v.ensureFor(ctx.member);
+          s.textChannelId = ctx.message.channelId;
+          ctx.message.channel.sendTyping().catch(() => {});
+          let seed;
+          try {
+            seed = await this.autoplay.vibeSeed(name, ctx.member.user);
+          } catch (err) {
+            throw new UserError(`Couldn't start that vibe. (${err.message.slice(0, 150)})`);
+          }
+          if (!seed) throw new UserError('No songs found for that vibe. Try another one.');
+          if (!s.autoplay) this.autoplay.setEnabled(true);
+          const { position } = s.add([seed]);
+          s.start();
+          const where = position === 0 ? 'Starting with' : `Up #${position}:`;
+          return ctx.reply(`${VIBES[name].emoji} **${name}** radio on. ${where} ${trackLabel(seed)}. Autoplay keeps the vibe going.`, COLORS.playing);
         },
       },
       {

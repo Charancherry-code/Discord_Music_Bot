@@ -99,13 +99,13 @@ export class NowPlayingCard {
       : s.loop === 'queue'
         ? 'restart from top'
         : '—';
-    const requester = track.requesterId ? `<@${track.requesterId}>` : 'playlist.txt';
+    const requester = track.autoplay ? '🎲 autoplay' : track.requesterId ? `<@${track.requesterId}>` : 'playlist.txt';
 
     const lines = [
       ...(track.author ? [`by **${cleanTitle(track.author, 60)}**`, ''] : []),
       timeline,
       '',
-      `\`queue\` ${s.index + 1}/${s.tracks.length} · \`loop\` ${s.loop}`,
+      `\`queue\` ${s.index + 1}/${s.tracks.length} · \`loop\` ${s.loop} · \`auto\` ${s.autoplay ? 'on' : 'off'}`,
       `\`req\` ${requester}`,
       `\`next\` ${nextLine}`,
     ];
@@ -134,6 +134,7 @@ export class NowPlayingCard {
     const row2 = new ActionRowBuilder().addComponents(
       btn('loop', s.loop === 'song' ? '🔂' : '🔁', s.loop === 'off' ? ButtonStyle.Secondary : ButtonStyle.Success),
       btn('shuffle', '🔀', ButtonStyle.Secondary, next.length < 2),
+      btn('autoplay', '🎲', s.autoplay ? ButtonStyle.Success : ButtonStyle.Secondary),
       btn('queue', '📜'),
     );
     return { embeds: [embed], components: [row1, row2] };

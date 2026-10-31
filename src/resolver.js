@@ -4,6 +4,8 @@ import { log } from './logger.js';
 import { JsonStore } from './store.js';
 import { searchTracks } from './ytdlp.js';
 
+const MAX_ENTRIES = 5000;
+
 export class Resolver {
   constructor(cacheFile) {
     this.store = new JsonStore(cacheFile, {});
@@ -22,6 +24,9 @@ export class Resolver {
     const [result] = await searchTracks(query, 1, signal);
     if (!result) throw new Error(`no results for "${query}"`);
     this.store.data[key] = result;
+    // Big Spotify playlists add many entries; keep the file small by dropping the oldest.
+    const keys = Object.keys(this.store.data);
+    for (let n = 0; n < keys.length - MAX_ENTRIES; n++) delete this.store.data[keys[n]];
     this.store.save(2000);
     return result;
   }

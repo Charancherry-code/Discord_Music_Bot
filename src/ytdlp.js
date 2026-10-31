@@ -90,8 +90,10 @@ export function parseInfoLine(line) {
  * Lists the playable entries behind a URL or search target without downloading anything.
  * A single video returns one entry; a playlist returns up to `limit`.
  */
-export async function fetchEntries(target, { limit = 200, signal } = {}) {
-  const out = await run(['--flat-playlist', '--playlist-end', String(limit), '-O', INFO_TEMPLATE, '--', target], {
+export async function fetchEntries(target, { limit = 200, signal, playlist = false } = {}) {
+  // --yes-playlist overrides the default --no-playlist (needed for "watch?v=...&list=..." URLs like mixes).
+  const extra = playlist ? ['--yes-playlist'] : [];
+  const out = await run([...extra, '--flat-playlist', '--playlist-end', String(limit), '-O', INFO_TEMPLATE, '--', target], {
     signal,
     timeoutMs: 60_000,
   });
@@ -104,6 +106,16 @@ export async function fetchEntries(target, { limit = 200, signal } = {}) {
 }
 
 const VIDEO_ID = /^[\w-]{11}$/;
+
+/** YouTube video ID from any YouTube / YouTube Music URL, or null. */
+export function youtubeId(url) {
+  return String(url ?? '').match(/(?:[?&]v=|youtu\.be\/|\/shorts\/|\/embed\/)([\w-]{11})/)?.[1] ?? null;
+}
+
+/** YouTube's "Mix" for a video: the same similar-songs list YouTube autoplays. */
+export function fetchMix(videoId, signal) {
+  return fetchEntries(`https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`, { limit: 30, signal, playlist: true });
+}
 
 /**
  * Top `count` results for a search phrase. Searches YouTube Music's "Songs" first: those are

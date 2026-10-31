@@ -4,10 +4,10 @@ import { statSync } from 'node:fs';
 import path from 'node:path';
 import { config, ROOT_DIR } from './config.js';
 import { log } from './logger.js';
+import { getSpotifyTracks, SPOTIFY_RE } from './spotify.js';
 import { fetchEntries, searchTracks } from './ytdlp.js';
 
 const URL_RE = /^https?:\/\/\S+$/i;
-const SPOTIFY_RE = /^(https?:\/\/(open\.)?spotify\.com\/|spotify:)/i;
 
 /** An error whose message is safe and useful to show to the user. */
 export class UserError extends Error {}
@@ -34,7 +34,21 @@ export function makeTrack(info, requester) {
 
 /** Resolves what a user typed after `cplay` into one or more tracks. */
 export async function resolveInput(input, requester, signal) {
-  if (SPOTIFY_RE.test(input)) throw new UserError('Spotify links arrive in Stage 2. Use a song name or YouTube link for now.');
+  if (SPOTIFY_RE.test(input)) {
+    let songs;
+    try {
+      songs = await getSpotifyTracks(input, signal);
+    } catch (err) {
+      throw new UserError(`I couldn't read that Spotify link: ${err.message.slice(0, 180)}.`);
+    }
+    if (!songs.length) throw new UserError('That Spotify link has no songs.');
+    // Each song is searched on YouTube Music right before it plays (cached), so this is instant.
+    return songs.map((s) => ({
+      ...makeTrack({ ...s, url: null }, requester),
+      query: s.author ? `${s.author} - ${s.title}` : s.title,
+      source: 'spotify',
+    }));
+  }
 
   if (URL_RE.test(input)) {
     let entries;
