@@ -8,7 +8,9 @@ import { log } from './logger.js';
 import { makeTrack } from './sources.js';
 import { fetchMix, searchTracks, youtubeId } from './ytdlp.js';
 
-const HISTORY_SIZE = 50;
+const HISTORY_SIZE = 50; // in-memory list used to pick Mix seeds and the language
+const NO_REPEAT_MS = 48 * 60 * 60_000; // autoplay never picks a song played in the last 2 days
+const HISTORY_MAX_ENTRIES = 5000;
 const LANGUAGE_WINDOW = 3; // the language of the last few known songs decides
 const MIX_CACHE_SIZE = 30;
 const MIX_CACHE_TTL_MS = 30 * 60_000;
@@ -48,16 +50,20 @@ export const VIBES = {
 
 export class Autoplay {
   #recentIds = [];
-  #recentKeys = [];
   #recentLanguages = []; // detected language of played songs (null = unknown)
   #lockedLanguage = null; // set by cvibe; cleared when someone requests a song
   #mixCache = new Map(); // key -> { entries, at }
   #busy = null;
   #failedAt = 0;
 
-  constructor(session, settings) {
+  /**
+   * @param history JsonStore of { played: { "id:<videoId>" | "key:<songKey>": timestamp } }.
+   * Saved to disk, so the 2-day no-repeat rule survives restarts.
+   */
+  constructor(session, settings, history) {
     this.session = session;
     this.settings = settings;
+    this.history = history;
 
     session.on('trackStart', (track) => {
       // A song someone asked for sets the direction again (a vibe seed keeps its lock).
@@ -200,10 +206,20 @@ export class Autoplay {
     return entries;
   }
 
+  get #played() {
+    return (this.history.data.played ??= {});
+  }
+
+  /** True if this song (any upload of it) was played in the last 2 days. */
+  #playedRecently(id, key) {
+    const cutoff = Date.now() - NO_REPEAT_MS;
+    return (id && this.#played[`id:${id}`] > cutoff) || (key && this.#played[`key:${key}`] > cutoff);
+  }
+
   #acceptable(entry) {
     const id = youtubeId(entry.url);
-    if (!id || this.#recentIds.includes(id)) return false;
-    if (this.#recentKeys.includes(songKey(entry.title))) return false; // same song, other upload
+    if (!id) return false;
+    if (this.#playedRecently(id, songKey(entry.title))) return false; // same song or another upload of it
     if (NOT_A_SONG.test(entry.title ?? '')) return false;
     if (entry.duration && (entry.duration < MIN_SEC || entry.duration > MAX_SEC)) return false;
     return true;
@@ -211,10 +227,22 @@ export class Autoplay {
 
   #remember(track) {
     const id = youtubeId(track.url);
+    const key = songKey(track.title);
+    const now = Date.now();
+    const played = this.#played;
+    if (id) played[`id:${id}`] = now;
+    if (key) played[`key:${key}`] = now;
+
+    // Drop entries older than 2 days, and cap the file size.
+    const cutoff = now - NO_REPEAT_MS;
+    for (const k of Object.keys(played)) if (played[k] < cutoff) delete played[k];
+    const keys = Object.keys(played);
+    for (let n = 0; n < keys.length - HISTORY_MAX_ENTRIES; n++) delete played[keys[n]];
+    this.history.save(5_000);
+
     if (id) this.#recentIds.push(id);
-    this.#recentKeys.push(songKey(track.title));
     this.#recentLanguages.push(detectLanguage(track));
-    for (const list of [this.#recentIds, this.#recentKeys, this.#recentLanguages]) {
+    for (const list of [this.#recentIds, this.#recentLanguages]) {
       if (list.length > HISTORY_SIZE) list.shift();
     }
   }

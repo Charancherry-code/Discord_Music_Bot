@@ -16,7 +16,8 @@ A private, Jockie-style music bot for one server. It follows you between voice c
 
 When the last queued song starts playing, autoplay picks a similar song from **YouTube's Mix** for it and queues it, so it preloads and plays without a gap.
 
-- Skips songs played in the last 50, other uploads of the same song, and compilations, jukeboxes, covers, slowed/8D edits and anything shorter than 90 s or longer than 10 min.
+- **Never repeats a song within 2 days**, including other uploads of the same song. The history is saved in `data/history.json`, so it survives restarts. Songs you ask for with `cplay`, `clink` or `csearch` always play.
+- Skips and compilations, jukeboxes, covers, slowed/8D edits and anything shorter than 90 s or longer than 10 min.
 - **Stays in the same language.** It guesses each song's language (Telugu, Hindi, Tamil, Punjabi, Kannada, Malayalam, Bengali, Marathi, English) from its script, words like "Telugu" or "Bollywood", and well-known channels and artists. The last 3 songs decide. Picks in that language come first, songs it can't place come next, and songs clearly in another language are never picked. If a Mix has drifted away, it searches for songs in that language instead.
 - `cvibe telugu` (and the other language vibes) locks autoplay to that language until someone requests a song.
 - Songs people request always play before autoplay picks (marked 🎲 in `cqueue`).

@@ -55,6 +55,7 @@ const client = new Client({
 const settings = new JsonStore(path.join(config.dataDir, 'settings.json'), { follow: true, soundProfile: DEFAULT_PROFILE });
 const permissionsStore = new JsonStore(path.join(config.dataDir, 'permissions.json'), { users: [], roles: [] });
 const sessionStore = new JsonStore(path.join(config.dataDir, 'session.json'), {});
+const historyStore = new JsonStore(path.join(config.dataDir, 'history.json'), { played: {} });
 
 const resolver = new Resolver(config.cacheFile);
 const session = new MusicSession(resolver);
@@ -62,7 +63,7 @@ const voice = new VoiceManager(client, session, settings);
 const card = new NowPlayingCard(client, session);
 let commands = null;
 
-const autoplay = new Autoplay(session, settings);
+const autoplay = new Autoplay(session, settings, historyStore);
 
 // When the queue runs out: similar songs if autoplay is on, otherwise playlist.txt
 // (only in your channel, re-read each time).
@@ -187,7 +188,7 @@ async function shutdown(signal) {
   try {
     clearTimeout(saveTimer);
     sessionStore.data = buildSnapshot(); // Saved before leaving so a restart resumes here.
-    await Promise.allSettled([sessionStore.flush(), resolver.flush(), settings.flush(), permissionsStore.flush()]);
+    await Promise.allSettled([sessionStore.flush(), resolver.flush(), settings.flush(), permissionsStore.flush(), historyStore.flush()]);
     voice.leave();
     await client.destroy();
   } finally {
@@ -242,7 +243,7 @@ async function main() {
     log.error(`yt-dlp is unavailable (${err.message}). The bot can join voice but can't stream until this is fixed.`);
   }
 
-  await Promise.all([resolver.load(), settings.load(), permissionsStore.load(), sessionStore.load()]);
+  await Promise.all([resolver.load(), settings.load(), permissionsStore.load(), sessionStore.load(), historyStore.load()]);
 
   // Test ffmpeg with the real filter chains so a broken binary or filter can't silence every song.
   const ff = await checkFfmpeg(getProfile('bass').filters);
@@ -257,15 +258,24 @@ async function main() {
   session.autoplay = settings.data.autoplay !== false; // on unless you turned it off
   commands = new CommandHandler({ session, voice, perms: new Permissions(permissionsStore), settings, card, autoplay });
 
-  try {
-    await client.login(config.token);
-  } catch (err) {
-    if (/disallowed intents/i.test(err.message)) {
-      log.error('Login failed: turn on "Message Content Intent" in the Developer Portal (Bot page), then restart.');
-    } else {
-      log.error(`Login failed: ${err.message}. Check DISCORD_TOKEN.`);
+  // Network problems are retried forever (with backoff); a bad token or intent stops the bot.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await client.login(config.token);
+      return;
+    } catch (err) {
+      if (/disallowed intents/i.test(err.message)) {
+        log.error('Login failed: turn on "Message Content Intent" in the Developer Portal (Bot page), then restart.');
+        process.exit(1);
+      }
+      if (/token/i.test(err.message) || err.code === 'TokenInvalid') {
+        log.error(`Login failed: ${err.message}. Check DISCORD_TOKEN.`);
+        process.exit(1);
+      }
+      const waitSec = Math.min(60, 5 * attempt);
+      log.warn(`Can't reach Discord (${err.message}). Retrying in ${waitSec}s (attempt ${attempt}).`);
+      await new Promise((r) => setTimeout(r, waitSec * 1000));
     }
-    process.exit(1);
   }
 }
 

@@ -52,7 +52,7 @@ Node.js ESM, discord.js v14.27, @discordjs/voice 0.19.2 (DAVE encryption is buil
 | `src/resolver.js` | Cached search phrase → URL (`.cache/resolved.json`, capped at 5000 entries) |
 | `src/voice.js` | Following the owner, joining for `cplay`, auto-pause when empty, leaving when idle or empty, reconnect |
 | `src/commands.js` | `c`-prefix commands, permission rules, Now Playing buttons |
-| `src/nowplaying.js` | Live Now Playing card: plain markdown, so it wraps well in narrow panels |
+| `src/nowplaying.js` | Live Now Playing card, "D+" IDE style: breadcrumb, inline-code chips, `// next →`, ⚠/✖ diagnostics, "developed by cherry" footer. No code block, so it wraps cleanly everywhere. |
 | `src/profiles.js` | Sound profiles (ffmpeg filter chains) |
 | `src/permissions.js`, `src/store.js`, `src/format.js`, `src/logger.js` | Helpers |
 | `scripts/setup-server.js` | One-time server layout tool. Already run; it never deletes channels. |
@@ -76,7 +76,7 @@ Node.js ESM, discord.js v14.27, @discordjs/voice 0.19.2 (DAVE encryption is buil
 - **Requested songs go before filler.** Filler means `playlist.txt` entries (`isDefault`) and autoplay picks (`autoplay`).
 - **Spotify:** tracks keep Spotify's metadata. `query = "artist - title"` is resolved right before playing (`source: 'spotify'`).
 - **Autoplay:** topped up while the last song plays, so the pick can preload. It retries no sooner than 60 s after a failed lookup. Off means `playlist.txt` as the fallback in the owner's channel.
-- **Autoplay language:** the most common detected language of the last 3 known songs (or the `cvibe` lock). Same-language picks first, unknown second, other languages never; if every Mix drifted, it searches "<language> hit songs". **No skip-learning:** the owner asked to remove it (it blocked good songs).
+- **Autoplay language:** the most common detected language of the last 3 known songs (or the `cvibe` lock). Same-language picks first, unknown second, other languages never; if every Mix drifted, it searches "<language> hit songs". **No repeats for 2 days** (`NO_REPEAT_MS`): every played song (video ID and title key) goes into `data/history.json`; autoplay and `cvibe` never pick one within 48 h. Requested songs are never blocked. **No skip-learning:** the owner asked to remove it (it blocked good songs).
 - **Process priority:** above normal for the bot and ffmpeg.
 - **Leaving voice:** if the owner leaves while music plays, the bot leaves and keeps the queue for **3 minutes** (`FORGET_AFTER_MS` in `voice.js`). If the owner rejoins in time, music continues from the same spot. If not, the queue is cleared. On restart, a saved queue that's more than 3 minutes old with nobody listening is dropped too.
 - **Link mode (`clink`):** per channel, saved in `settings.json` as `linkChannels`. It only triggers when the whole message is music links (`MUSIC_LINK_RE` in `commands.js`). Unapproved users are ignored silently.
@@ -105,26 +105,32 @@ The running bot was started **30 Oct 13:56**, so it is **old code**. Everything 
 
 | # | Test | Expected | Status |
 | --- | --- | --- | --- |
-| 1 | Restart with the new code | Starts with no errors. Check `bot-err.log`. | ⏳ |
-| 2 | Join voice | The bot joins **silently** (no `playlist.txt loaded` in the log) | ⏳ |
-| 3 | Switch channels while music plays | Moves with you and keeps playing | ⏳ |
-| 4 | `cplay` 3 songs, wait about 30 s, press ⏭ | The next song starts in about 1 s (preloaded). Check the times between `Button "skip"` and `Now playing`. | ⏳ |
-| 5 | Skip twice quickly | The second skip loads normally (3–15 s); no crash | ⏳ |
-| 6 | Spotify track / album / playlist link in `cplay` | Added instantly, plays from YouTube Music, and the card shows Spotify's title | ⏳ |
-| 7 | Let the queue run out (autoplay on) | `Autoplay queued: …` while the last song plays, then a seamless change | ⏳ |
-| 8 | Play a Telugu song, let autoplay run 3–4 songs | Picks stay Telugu; log shows `Autoplay queued: … [telugu]` | ⏳ |
-| 9 | 🎲 button and `cautoplay off` | Toggles; turning it off removes queued picks | ⏳ |
-| 10 | `cvibe telugu` (and `cvibe` alone) | Starts a fitting song, then keeps going with similar ones; `cvibe` lists the moods | ⏳ |
-| 11 | ⏮ previous, 🔀 shuffle, 📜 queue, ⏹ stop | Each works (never confirmed in the logs) | ⏳ |
-| 12 | `cping` | Mostly 🟢 | ⏳ |
-| 13 | `csound bass` / `vocal` mid-song | Applies within a few seconds from the same spot | ⏳ |
-| 14 | An approved user (`cgrant`) while the owner is in voice | Gets "Busy with the owner" (allikhan0399 pressed buttons on 31 Oct; result unconfirmed) | ⏳ |
-| 15 | On the hosting laptop at about 100 Mbps | No `Stutter:` lines; first song in under 8 s | ⏳ |
-| 16 | Task Manager while gaming | Bot total roughly 300–400 MB RAM, about 1% CPU, no FPS drop | ⏳ |
-| 17 | `clink`, then paste a YouTube link, then a Spotify link | "Link mode is ON"; first link plays, second is queued; `clink` again shows "Link mode is OFF" | ⏳ |
-| 18 | Paste a link with extra text, or as an unapproved user, in link mode | Ignored, no reply | ⏳ |
-| 19 | Leave voice mid-song, rejoin within 3 min | The bot follows and continues the same song from the same spot | ⏳ |
-| 20 | Leave voice mid-song, rejoin after 3+ min | Log: "Owner didn't come back within 3 min; cleared the queue"; the bot joins silently with an empty queue | ⏳ |
+Tested 31 Oct 2026. **✅ log** = confirmed in `bot.log`; **✅ owner** = owner tested in Discord (these commands don't write to the log).
+
+| # | Test | Expected | Status |
+| --- | --- | --- | --- |
+| 1 | Restart with the new code | Starts with no errors | ✅ log (login retry worked after a network drop) |
+| 2 | Join voice | The bot joins **silently** | ✅ owner |
+| 3 | Switch channels while music plays | Moves with you and keeps playing | ✅ owner |
+| 4 | Press ⏭ on a preloaded song | The next song starts in about 1 s | ✅ log: **0.5 s** (19:30:21 → 19:30:22) |
+| 5 | Skip twice quickly | The second skip loads normally, no crash | ✅ log: 8–13 s, no errors |
+| 6 | Spotify track / playlist link in `cplay` | Added instantly, plays, card shows `⎇ spotify` | ✅ owner |
+| 7 | Let the queue run out (autoplay on) | `Autoplay queued: …` while the last song plays, seamless change | ✅ log: 12 picks in a row, all `[hindi]` |
+| 8 | Play a Telugu song, let autoplay run | Picks stay Telugu | ✅ owner |
+| 9 | 🎲 button | Toggles autoplay | ✅ log |
+| 10 | `cvibe telugu` | Starts a Telugu song, keeps going in Telugu | ✅ owner (log: "Vibe Undi [Telugu]") |
+| 11 | ⏮ ⏸ 🔁 📜 ⏹ | Each works | ✅ log |
+| 12 | `cping` | Mostly 🟢 | ✅ owner |
+| 13 | `csound bass` / `hifi` mid-song | Applies within a few seconds | ✅ owner |
+| 14 | An approved user while the owner is in voice | Gets "Busy with the owner" | ✅ owner |
+| 15 | On the hosting laptop at about 100 Mbps | No `Stutter:` lines; first song in under 8 s | ⏳ not on the laptop yet |
+| 16 | Task Manager while gaming | Bot roughly 300–400 MB RAM, about 1% CPU, no FPS drop | ⏳ not on the laptop yet |
+| 17 | `clink` on, paste links, `clink` off | ON message, first plays, second queued, OFF message | ✅ owner |
+| 18 | Paste a link with extra text in link mode | Ignored, no reply | ⏳ not tested |
+| 19 | Leave voice mid-song, rejoin within 3 min | Continues the same song | ✅ owner |
+| 20 | Leave voice, rejoin after 3+ min | Joins silently with an empty queue | ✅ owner |
+
+Session stats from the log: 0 stutters, 0 failed songs, no errors besides the login retries.
 
 Also pending for the owner:
 - [ ] Push Stage 2: `git add src README.md CONTEXT.md` → `git commit -m "Stage 2"` → `git push`
@@ -139,10 +145,13 @@ Also pending for the owner:
 | --- | --- | --- |
 | 1 | Playback, queue, card, permissions, follow, auto-pause, resume | ✅ |
 | Sound | Profiles, YouTube Music search, `cping`, nettest | ✅ |
-| 2 | Spotify, smart autoplay, `cvibe` | ✅ built, ⏳ testing |
+| 2 | Spotify, smart autoplay, `cvibe` | ✅ tested |
+| 2+ | `clink`, 3-min queue expiry, same-language autoplay, 2-day no-repeat, D+ card, login retry | ✅ tested |
 | 3 | Effects (slowed + reverb, nightcore, 8D, lofi), `cvolume`, `cseek`, synced `clyrics` (LRCLIB) | ⬜ next |
 | 4 | `csave`/`cload` playlists, ❤️ liked songs, `chistory`, `ctop`/`cwrapped` stats, `csleep`, song name on the voice channel, "Listening to…" status | ⬜ |
 | Extra | `start-bot.bat` / start on boot for the laptop; optional YouTube Premium cookies for 256 kbps AAC | ⬜ |
+
+**Web player (future):** a built-in `node:http` server (no new dependencies) with a mobile-first page in the D+ style: cover, chips, big controls, search-to-play, queue editing, and live updates over Server-Sent Events. It calls the same `MusicSession` methods, so all the rules stay the same. Recommended setup: **Tailscale** for access from anywhere (never public) and a **secret link** sent by `cweb` in a DM, with a resettable key. Discord OAuth login, which would also let `cgrant` users in, can come later. Cloudflare Tunnel only with strong auth.
 
 **Open-source release (after the bot is finished):** strip personal data (keep `CONTEXT.md` local, generalize or drop `setup-server.js`), MIT license, a disclaimer for YouTube/Spotify terms, a setup wizard and `start.bat`, a README with screenshots, a landing page on GitHub Pages (`docs/`), then share on r/selfhosted, r/discordapp, GitHub topics and Indian Discord communities.
 

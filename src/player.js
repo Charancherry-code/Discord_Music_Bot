@@ -33,6 +33,9 @@ export class MusicSession extends EventEmitter {
   textChannelId = null;
   /** How long the last song took to start (search done, until first audio), in ms. */
   lastLoadMs = null;
+  /** Counters shown on the card: songs that failed to load, and stutters (late audio). */
+  failedCount = 0;
+  stutters = 0;
   /** Set by the app: returns tracks to append when the queue runs out (e.g. playlist.txt). */
   onQueueEnd = null;
   /** Set by the app: returns { filters, bitrate } for the next track (sound profile, channel bitrate). */
@@ -81,7 +84,7 @@ export class MusicSession extends EventEmitter {
       const missed = state.status === AudioPlayerStatus.Playing ? state.missedFrames ?? 0 : 0;
       if (missed > 0 && Date.now() - lastReport > 10_000) {
         lastReport = Date.now();
-        this.stutters = (this.stutters ?? 0) + 1;
+        this.stutters++;
         log.warn(`Stutter: audio data arrived late (${missed} missed frames). Cause: slow download or busy CPU.`);
       }
     }, 1_000).unref();
@@ -384,6 +387,7 @@ export class MusicSession extends EventEmitter {
       this.#advance(true);
     } else {
       this.#failures++;
+      this.failedCount++;
       log.warn(`Track ended after ${playedMs}ms; treating it as a failed stream.`);
       this.#advance(false);
     }
@@ -567,6 +571,7 @@ export class MusicSession extends EventEmitter {
       const track = this.tracks[this.index];
       if (track?.query) this.resolver.forget(track.query);
       this.#failures++;
+      this.failedCount++;
       log.warn(`Skipping "${track?.title ?? 'unknown'}": ${err.message}`);
       this.emit('trackError', track, err);
       this.#advance(false);
