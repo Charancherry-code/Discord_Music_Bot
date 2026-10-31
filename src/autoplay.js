@@ -1,17 +1,17 @@
 // Smart autoplay: when the queue is about to run out, add a similar song from YouTube's Mix
-// for the current song. It avoids repeats, skips compilations/covers, and learns from quick skips.
+// for the current song. It avoids repeats and compilations, and stays in the same language.
 //
 // The next pick is added while the current song is still playing (not after it ends),
 // so the player can preload it and the change of song is seamless.
+import { detectLanguage } from './language.js';
 import { log } from './logger.js';
-import { searchTracks, fetchMix, youtubeId } from './ytdlp.js';
 import { makeTrack } from './sources.js';
+import { fetchMix, searchTracks, youtubeId } from './ytdlp.js';
 
 const HISTORY_SIZE = 50;
+const LANGUAGE_WINDOW = 3; // the language of the last few known songs decides
 const MIX_CACHE_SIZE = 30;
 const MIX_CACHE_TTL_MS = 30 * 60_000;
-const QUICK_SKIP_SEC = 30;
-const DISLIKE_MS = 2 * 60 * 60_000;
 const MIN_SEC = 90;
 const MAX_SEC = 600; // longer than 10 min is usually a jukebox or album upload
 const PICK_FROM_TOP = 5; // random among the most relevant few, for variety
@@ -32,27 +32,26 @@ export function songKey(title) {
     .replace(/[^\p{L}\p{N}]+/gu, '');
 }
 
-const artistKey = (s) => String(s ?? '').toLowerCase().replace(/\s+-\s+topic$/, '').replace(/[^\p{L}\p{N}]+/gu, '');
-
-/** Moods for `cvibe`: a search that finds a good first song; autoplay keeps the mood going. */
+/** Moods for `cvibe`: a search for the first song, and the language autoplay should stick to. */
 export const VIBES = {
-  chill: { emoji: '🌙', search: 'chill lofi hindi songs' },
-  romantic: { emoji: '💕', search: 'romantic hindi songs' },
-  sad: { emoji: '🥀', search: 'sad hindi songs' },
-  party: { emoji: '🎉', search: 'bollywood party songs' },
-  gym: { emoji: '💪', search: 'gym workout motivation songs' },
-  punjabi: { emoji: '🎺', search: 'punjabi hit songs' },
-  telugu: { emoji: '🎬', search: 'telugu hit songs' },
-  tamil: { emoji: '🥁', search: 'tamil hit songs' },
-  english: { emoji: '🎸', search: 'english pop hits' },
-  focus: { emoji: '🎧', search: 'instrumental focus music' },
+  chill: { emoji: '🌙', search: 'chill lofi hindi songs', language: 'hindi' },
+  romantic: { emoji: '💕', search: 'romantic hindi songs', language: 'hindi' },
+  sad: { emoji: '🥀', search: 'sad hindi songs', language: 'hindi' },
+  party: { emoji: '🎉', search: 'bollywood party songs', language: 'hindi' },
+  gym: { emoji: '💪', search: 'gym workout motivation songs', language: null },
+  punjabi: { emoji: '🎺', search: 'punjabi hit songs', language: 'punjabi' },
+  telugu: { emoji: '🎬', search: 'telugu hit songs', language: 'telugu' },
+  tamil: { emoji: '🥁', search: 'tamil hit songs', language: 'tamil' },
+  english: { emoji: '🎸', search: 'english pop hits', language: 'english' },
+  focus: { emoji: '🎧', search: 'instrumental focus music', language: null },
 };
 
 export class Autoplay {
   #recentIds = [];
   #recentKeys = [];
-  #disliked = new Map(); // artistKey -> expiry time
-  #mixCache = new Map(); // videoId -> { entries, at }
+  #recentLanguages = []; // detected language of played songs (null = unknown)
+  #lockedLanguage = null; // set by cvibe; cleared when someone requests a song
+  #mixCache = new Map(); // key -> { entries, at }
   #busy = null;
   #failedAt = 0;
 
@@ -61,11 +60,23 @@ export class Autoplay {
     this.settings = settings;
 
     session.on('trackStart', (track) => {
+      // A song someone asked for sets the direction again (a vibe seed keeps its lock).
+      if (!track.autoplay && !track.vibe) this.#lockedLanguage = null;
       this.#remember(track);
       this.#topUp();
     });
-    session.on('skip', (track, playedSec) => this.#learn(track, playedSec));
     session.on('change', () => this.#topUp());
+  }
+
+  /** The language autoplay is following right now, or null if it isn't sure. */
+  get language() {
+    if (this.#lockedLanguage) return this.#lockedLanguage;
+    const known = this.#recentLanguages.filter(Boolean).slice(-LANGUAGE_WINDOW);
+    if (!known.length) return null;
+    const counts = {};
+    for (const lang of known) counts[lang] = (counts[lang] ?? 0) + 1;
+    // Most common; ties go to the most recent song.
+    return known.reduceRight((best, lang) => (counts[lang] > (counts[best] ?? 0) ? lang : best), known.at(-1));
   }
 
   /** Turns autoplay on or off and saves the choice. Turning it off removes queued picks. */
@@ -103,13 +114,14 @@ export class Autoplay {
     return this.#busy;
   }
 
-  /** First song for a vibe (cvibe): a random pick from the top results of the vibe's search. */
+  /** First song for a vibe (cvibe). Also locks autoplay to the vibe's language. */
   async vibeSeed(name, requester) {
     const vibe = VIBES[name];
     const results = (await searchTracks(vibe.search, 8)).filter((r) => this.#acceptable(r));
     if (!results.length) return null;
+    this.#lockedLanguage = vibe.language;
     const pick = results[Math.floor(Math.random() * Math.min(PICK_FROM_TOP, results.length))];
-    return makeTrack(pick, requester);
+    return { ...makeTrack(pick, requester), vibe: name };
   }
 
   // ---------- internals ----------
@@ -122,22 +134,54 @@ export class Autoplay {
     this.next().then((picks) => {
       // Re-check: the queue may have changed while we were looking.
       if (picks.length && s.autoplay && s.loop === 'off' && s.nowPlaying && !s.upcoming.length) {
-        log.info(`Autoplay queued: ${picks[0].title}`);
+        const lang = detectLanguage(picks[0]);
+        log.info(`Autoplay queued: ${picks[0].title}${lang ? ` [${lang}]` : ''}`);
         s.add(picks);
       }
     });
   }
 
   async #pick() {
-    const seeds = this.#seeds();
-    for (const seed of seeds) {
-      const entries = await this.#mix(seed);
-      const fresh = entries.filter((e) => this.#acceptable(e));
-      if (!fresh.length) continue;
-      const pick = fresh[Math.floor(Math.random() * Math.min(PICK_FROM_TOP, fresh.length))];
-      return [{ ...makeTrack(pick, null), autoplay: true }];
+    const language = this.language;
+
+    // 1. Mixes of the current and recent songs, same-language picks first.
+    for (const seed of this.#seeds()) {
+      const pick = this.#choose(await this.#cached(seed, () => fetchMix(seed)), language);
+      if (pick) return [pick];
+    }
+
+    // 2. The Mixes only had other languages: search for songs in this language instead.
+    if (language) {
+      const query = Object.values(VIBES).find((v) => v.language === language)?.search ?? `${language} hit songs`;
+      const pick = this.#choose(await this.#cached(`search:${language}`, () => searchTracks(query, 15)), language);
+      if (pick) {
+        log.info(`Autoplay: the Mix drifted away from ${language}; picked from a ${language} search.`);
+        return [pick];
+      }
     }
     return [];
+  }
+
+  /**
+   * Chooses one entry: songs detected as the same language first, then songs of unknown language.
+   * Songs clearly in another language are never picked while a language is known.
+   */
+  #choose(entries, language) {
+    const fresh = entries.filter((e) => this.#acceptable(e));
+    let pool = fresh;
+    if (language) {
+      const same = [];
+      const unknown = [];
+      for (const e of fresh) {
+        const lang = detectLanguage(e);
+        if (lang === language) same.push(e);
+        else if (!lang) unknown.push(e);
+      }
+      pool = [...same, ...unknown];
+    }
+    if (!pool.length) return null;
+    const pick = pool[Math.floor(Math.random() * Math.min(PICK_FROM_TOP, pool.length))];
+    return { ...makeTrack(pick, null), autoplay: true };
   }
 
   /** Video IDs to base the pick on: the current song first, then recent ones. */
@@ -147,11 +191,11 @@ export class Autoplay {
     return [...new Set(ids)].slice(0, 3);
   }
 
-  async #mix(videoId) {
-    const hit = this.#mixCache.get(videoId);
+  async #cached(key, load) {
+    const hit = this.#mixCache.get(key);
     if (hit && Date.now() - hit.at < MIX_CACHE_TTL_MS) return hit.entries;
-    const entries = await fetchMix(videoId);
-    this.#mixCache.set(videoId, { entries, at: Date.now() });
+    const entries = await load();
+    this.#mixCache.set(key, { entries, at: Date.now() });
     if (this.#mixCache.size > MIX_CACHE_SIZE) this.#mixCache.delete(this.#mixCache.keys().next().value);
     return entries;
   }
@@ -162,11 +206,6 @@ export class Autoplay {
     if (this.#recentKeys.includes(songKey(entry.title))) return false; // same song, other upload
     if (NOT_A_SONG.test(entry.title ?? '')) return false;
     if (entry.duration && (entry.duration < MIN_SEC || entry.duration > MAX_SEC)) return false;
-    const now = Date.now();
-    for (const [artist, until] of this.#disliked) {
-      if (until < now) this.#disliked.delete(artist);
-      else if (artistKey(entry.author) === artist || artistKey(entry.title).includes(artist)) return false;
-    }
     return true;
   }
 
@@ -174,16 +213,9 @@ export class Autoplay {
     const id = youtubeId(track.url);
     if (id) this.#recentIds.push(id);
     this.#recentKeys.push(songKey(track.title));
-    if (this.#recentIds.length > HISTORY_SIZE) this.#recentIds.shift();
-    if (this.#recentKeys.length > HISTORY_SIZE) this.#recentKeys.shift();
-  }
-
-  /** Skipping an autoplay pick in its first 30 s means "not this artist" for 2 hours. */
-  #learn(track, playedSec) {
-    if (!track?.autoplay || playedSec >= QUICK_SKIP_SEC) return;
-    const artist = artistKey(track.author);
-    if (artist.length < 3) return; // too short to match safely
-    this.#disliked.set(artist, Date.now() + DISLIKE_MS);
-    log.info(`Autoplay: avoiding ${track.author} for 2 hours (skipped quickly).`);
+    this.#recentLanguages.push(detectLanguage(track));
+    for (const list of [this.#recentIds, this.#recentKeys, this.#recentLanguages]) {
+      if (list.length > HISTORY_SIZE) list.shift();
+    }
   }
 }

@@ -17,7 +17,8 @@ A private, Jockie-style music bot for one server. It follows you between voice c
 When the last queued song starts playing, autoplay picks a similar song from **YouTube's Mix** for it and queues it, so it preloads and plays without a gap.
 
 - Skips songs played in the last 50, other uploads of the same song, and compilations, jukeboxes, covers, slowed/8D edits and anything shorter than 90 s or longer than 10 min.
-- **Learns:** skip an autoplay pick within 30 s and that artist is avoided for 2 hours.
+- **Stays in the same language.** It guesses each song's language (Telugu, Hindi, Tamil, Punjabi, Kannada, Malayalam, Bengali, Marathi, English) from its script, words like "Telugu" or "Bollywood", and well-known channels and artists. The last 3 songs decide. Picks in that language come first, songs it can't place come next, and songs clearly in another language are never picked. If a Mix has drifted away, it searches for songs in that language instead.
+- `cvibe telugu` (and the other language vibes) locks autoplay to that language until someone requests a song.
 - Songs people request always play before autoplay picks (marked 🎲 in `cqueue`).
 - With loop on, autoplay waits. With autoplay off, the queue falls back to `playlist.txt` in your channel.
 
@@ -54,6 +55,7 @@ Prefix is `c`. Aliases are in brackets.
 | `cclear` | Clear Up Next |
 | `cshuffle` [`csh`] | Shuffle Up Next |
 | `cloop [off/song/queue]` [`crepeat`] | Set the loop mode. With nothing after it, cycles through the modes. |
+| `clink` [`clinkmode`] | Toggle **link mode** in this channel. While it's on, a message that's only YouTube, Spotify or SoundCloud links (up to 10) plays them like `cplay`. Messages with other text are ignored, and so are people without access. The setting survives restarts. |
 | `cautoplay [on/off]` [`cap`, `cauto`] | Keep playing similar songs when the queue runs out (on by default). The 🎲 button on the card toggles it too. |
 | `cvibe <mood>` [`cradio`, `cmood`] | Endless radio: chill, romantic, sad, party, gym, punjabi, telugu, tamil, english, focus. `cvibe` alone lists them. |
 | `csound [pure/hifi/bass/vocal]` [`cprofile`, `ceq`] | Pick the sound profile. It applies right away, from the same spot in the song. |

@@ -13,7 +13,7 @@ import { DEFAULT_PROFILE, encodeBitrate, getProfile, PROFILES } from './profiles
 import { Resolver } from './resolver.js';
 import { loadDefaultPlaylist } from './sources.js';
 import { JsonStore } from './store.js';
-import { VoiceManager } from './voice.js';
+import { FORGET_AFTER_MS, VoiceManager } from './voice.js';
 import { checkFfmpeg, raisePriority } from './audio.js';
 import { Autoplay } from './autoplay.js';
 import { ensureYtDlp } from './ytdlp-install.js';
@@ -104,6 +104,11 @@ setInterval(() => {
 async function restoreSession(guild) {
   const snap = sessionStore.data;
   if (!snap?.tracks?.length) return;
+  // Same rule as leaving voice: a queue left behind for more than 3 minutes is dropped.
+  if (!snap.channelId && Date.now() - (snap.savedAt ?? 0) > FORGET_AFTER_MS) {
+    log.info('Saved queue is older than 3 minutes and nobody was listening; starting fresh.');
+    return;
+  }
 
   session.restore(snap);
   session.textChannelId = snap.textChannelId ?? null;
@@ -111,7 +116,10 @@ async function restoreSession(guild) {
 
   const fresh = Date.now() - (snap.savedAt ?? 0) < SESSION_MAX_AGE_MS;
   if (!snap.channelId || !fresh) return;
-  if (settings.data.follow && voice.ownerInVoice()) return; // Following you takes priority.
+  if (settings.data.follow && voice.ownerInVoice()) {
+    voice.resumeOnNextJoin(); // following you rejoins your channel and continues the song
+    return;
+  }
 
   const channel = guild.channels.cache.get(snap.channelId);
   if (!channel?.isVoiceBased() || voice.humansIn(channel.id) === 0) return;

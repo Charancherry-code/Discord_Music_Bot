@@ -245,7 +245,6 @@ export class MusicSession extends EventEmitter {
 
   skip() {
     if (this.isIdle) return false;
-    if (this.nowPlaying) this.emit('skip', this.nowPlaying, this.positionSec); // autoplay learns from this
     if (this.#nextTimer && !this.#loading && this.audio.state.status === AudioPlayerStatus.Idle) {
       // Already moved on and waiting (e.g. failure backoff): play that next track right away.
       this.#failures = 0;

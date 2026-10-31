@@ -13,6 +13,10 @@ import { searchTracks } from './ytdlp.js';
 const MSG_NO_PERMISSION = "🔒 You don't have permission to use this bot.";
 const MSG_BUSY = '🎧 Busy with the owner. Try again when they leave voice.';
 const QUEUE_PAGE_SIZE = 10;
+const MAX_LINKS_PER_MESSAGE = 10;
+// Music links that link mode reacts to.
+const MUSIC_LINK_RE =
+  /^https?:\/\/(?:(?:www\.|m\.|music\.)?youtube\.com\/(?:watch|shorts|playlist|live)|youtu\.be\/|(?:www\.|m\.)?soundcloud\.com\/|on\.soundcloud\.com\/|open\.spotify\.com\/|spotify\.link\/|spotify\.app\.link\/)\S*$/i;
 
 const embed = (text, color = COLORS.idle) => new EmbedBuilder().setColor(color).setDescription(text);
 
@@ -57,6 +61,15 @@ export class CommandHandler {
 
     const content = message.content.trim();
     const prefix = config.prefix;
+
+    // Link mode: in a channel with clink on, a message that is only music links plays them.
+    if (this.#linkChannels().includes(message.channelId)) {
+      const links = content.split(/\s+/).map((w) => w.replace(/^<|>$/g, ''));
+      if (links.length && links.length <= MAX_LINKS_PER_MESSAGE && links.every((l) => MUSIC_LINK_RE.test(l))) {
+        return this.#playLinks(message, links);
+      }
+    }
+
     if (content.length <= prefix.length || !content.toLowerCase().startsWith(prefix)) return;
 
     const rawName = content.slice(prefix.length).split(/\s+/, 1)[0];
@@ -192,6 +205,39 @@ export class CommandHandler {
       .setFooter({
         text: `Page ${p + 1}/${pages} · ${upcoming.length} song(s) · ${formatDuration(total)} · Loop: ${s.loop}`,
       });
+  }
+
+  #linkChannels() {
+    return (this.settings.data.linkChannels ??= []);
+  }
+
+  /** Link mode: plays (or queues) pasted links, with the same access rules as cplay. */
+  async #playLinks(message, links) {
+    const member = message.member ?? (await message.guild.members.fetch(message.author.id).catch(() => null));
+    if (!member) return;
+    const reply = (text, color) =>
+      message
+        .reply({ embeds: [embed(text, color)], allowedMentions: { repliedUser: false } })
+        .catch((err) => log.debug(`Reply failed: ${err.message}`));
+
+    // People without access are ignored silently, so normal link sharing doesn't get spammed.
+    const denied = this.#deny(member);
+    if (denied === MSG_NO_PERMISSION) return;
+    if (denied) return reply(denied, COLORS.error);
+
+    const ctx = { message, member, reply };
+    try {
+      await this.voice.ensureFor(member);
+      this.session.textChannelId = message.channelId;
+      message.channel.sendTyping().catch(() => {});
+      const tracks = [];
+      for (const link of links) tracks.push(...(await resolveInput(link, member.user)));
+      return await this.#enqueue(ctx, tracks);
+    } catch (err) {
+      if (err instanceof UserError) return reply(err.message, COLORS.error);
+      log.error('Link mode failed:', err);
+      return reply('Something went wrong. Check the bot logs.', COLORS.error);
+    }
   }
 
   async #enqueue(ctx, tracks) {
@@ -488,6 +534,27 @@ export class CommandHandler {
           const applied = s.reapplyAudio();
           const p = PROFILES[wanted];
           return ctx.reply(`${p.emoji} Sound profile: **${p.label}**. ${applied ? 'Applied now.' : 'Applies to the next song.'}`, COLORS.playing);
+        },
+      },
+      {
+        name: 'link',
+        aliases: ['linkmode'],
+        usage: 'link',
+        description: 'Toggle link mode in this channel: pasted YouTube, Spotify or SoundCloud links play without cplay.',
+        run: (ctx) => {
+          const channels = this.#linkChannels();
+          const id = ctx.message.channelId;
+          const i = channels.indexOf(id);
+          const on = i === -1;
+          if (on) channels.push(id);
+          else channels.splice(i, 1);
+          this.settings.save();
+          return ctx.reply(
+            on
+              ? `🔗 **Link mode is ON** in <#${id}>.\nPaste a YouTube, Spotify or SoundCloud link to play it. Paste more and they get queued.\nType \`${config.prefix}link\` again to turn it off.`
+              : `🔗 **Link mode is OFF** in <#${id}>. Use \`${config.prefix}play <link>\` again.`,
+            on ? COLORS.playing : COLORS.idle,
+          );
         },
       },
       {

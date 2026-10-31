@@ -15,6 +15,7 @@ const OWNER_SYNC_DELAY_MS = 500; // Debounce for quick channel hopping.
 const READY_TIMEOUT_MS = 20_000;
 const RECONNECT_GRACE_MS = 5_000;
 const EMPTY_LEAVE_MS = 5 * 60_000;
+export const FORGET_AFTER_MS = 3 * 60_000; // after you leave voice, the queue is kept this long
 const IDLE_LEAVE_MS = 5 * 60_000;
 const MAX_JOINS_PER_WINDOW = 6;
 const JOIN_WINDOW_MS = 60_000;
@@ -31,6 +32,7 @@ export class VoiceManager {
   #wired = new WeakSet();
   #syncing = false;
   #resumeOnRejoin = false;
+  #forgetTimer = null;
   #pendingSync = false;
 
   constructor(client, session, settings) {
@@ -128,14 +130,23 @@ export class VoiceManager {
     const botChannel = this.channelId;
 
     if (!ownerChannel) {
-      // You left voice: leave too if the bot was with you.
+      // You left voice: leave too if the bot was with you. Come back within 3 minutes and the
+      // music continues from the same spot; after that the queue is cleared for a fresh start.
       if (botChannel && botChannel === previous) {
-        log.info('Owner left voice; leaving.');
+        const wasPlaying = this.session.active && (Boolean(this.session.nowPlaying) || !this.session.isIdle);
         this.leave();
+        if (wasPlaying) {
+          this.#resumeOnRejoin = true;
+          this.#startForgetTimer();
+          log.info(`Owner left voice; leaving. Rejoin within ${FORGET_AFTER_MS / 60_000} min to continue.`);
+        } else {
+          log.info('Owner left voice; leaving.');
+        }
       }
       return;
     }
 
+    this.#clearForgetTimer(); // you're back in voice
     if (!this.settings.data.follow) return;
     if (botChannel === ownerChannel) return;
 
@@ -213,6 +224,28 @@ export class VoiceManager {
     // Cleared as soon as a track starts; leaves if nothing ever plays (e.g. a failed cplay).
     this.#startIdleTimer();
     this.#scheduleOccupancyCheck();
+  }
+
+  /** The next time the bot follows you into a channel, continue the saved queue (used after a restart). */
+  resumeOnNextJoin() {
+    this.#resumeOnRejoin = true;
+  }
+
+  #startForgetTimer() {
+    this.#clearForgetTimer();
+    this.#forgetTimer = setTimeout(() => {
+      this.#forgetTimer = null;
+      this.#resumeOnRejoin = false;
+      if (this.channelId) return; // someone called the bot back in the meantime
+      log.info(`Owner didn't come back within ${FORGET_AFTER_MS / 60_000} min; cleared the queue.`);
+      this.session.stop();
+    }, FORGET_AFTER_MS);
+    this.#forgetTimer.unref();
+  }
+
+  #clearForgetTimer() {
+    clearTimeout(this.#forgetTimer);
+    this.#forgetTimer = null;
   }
 
   /** Leaves voice, keeping the queue so it can continue later. */
