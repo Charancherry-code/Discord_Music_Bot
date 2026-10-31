@@ -45,7 +45,8 @@ Node.js ESM, discord.js v14.27, @discordjs/voice 0.19.2 (DAVE encryption is buil
 | `src/player.js` | `MusicSession`: queue, loop, playback, failure backoff, **next-song preload**, stutter detector |
 | `src/audio.js` | Turns a track into an audio resource: buffering, Opus passthrough, ffmpeg encoding, process priority |
 | `src/ytdlp.js` | yt-dlp wrapper: search (YouTube Music first), flat lists, Mixes, streaming |
-| `src/sources.js` | `cplay` input → tracks (YouTube, SoundCloud, Spotify, search); `playlist.txt` loader |
+| `src/sources.js` | `cplay` input → tracks (YouTube, SoundCloud, Spotify, search) |
+| `src/status.js` | "Listening to <song>" on the bot profile + song name as the voice channel status |
 | `src/spotify.js` | Spotify links → track list, read from the public embed page, no API key |
 | `src/autoplay.js` | Smart autoplay from YouTube Mix, stays in the same language; `VIBES` for `cvibe` |
 | `src/language.js` | Guesses a song's language from script, keywords and known channels/artists |
@@ -73,12 +74,16 @@ Node.js ESM, discord.js v14.27, @discordjs/voice 0.19.2 (DAVE encryption is buil
 - **Preload:** the next song loads only after the current one has fully downloaded (or after 2 min), so the two downloads never compete.
 - **Following never starts music.** It only keeps playing if music was already active (a channel switch, or a dropped connection).
 - **Access rules:** owner always. Approved users (`cgrant`) only when the owner isn't in voice; otherwise "Busy with the owner". Short aliases from unapproved users are ignored silently.
-- **Requested songs go before filler.** Filler means `playlist.txt` entries (`isDefault`) and autoplay picks (`autoplay`).
+- **Requested songs go before autoplay picks** (`autoplay: true`).
+- **`playlist.txt` was removed completely (1 Nov) at the owner's request**: its 3 songs kept coming back when autoplay had nothing. Don't add a default playlist back. Old saved queues have their `isDefault` songs dropped on restore.
+- **Status (`status.js`):** voice channel status via `PUT /channels/{id}/voice-status` (not in discord.js) and a "Listening to" activity. Updated only on song change/stop/move, debounced 1.5 s. Needs the "Set Voice Channel Status" permission; a 403 is logged once and ignored.
 - **Spotify:** tracks keep Spotify's metadata. `query = "artist - title"` is resolved right before playing (`source: 'spotify'`).
-- **Autoplay:** topped up while the last song plays, so the pick can preload. It retries no sooner than 60 s after a failed lookup. Off means `playlist.txt` as the fallback in the owner's channel.
+- **Autoplay:** topped up while the last song plays, so the pick can preload. It retries no sooner than 60 s after a failed lookup. With autoplay off, the music stops at the end of the queue.
 - **Autoplay language:** the most common detected language of the last 3 known songs (or the `cvibe` lock). Same-language picks first, unknown second, other languages never; if every Mix drifted, it searches "<language> hit songs". **No repeats for 2 days** (`NO_REPEAT_MS`): every played song (video ID and title key) goes into `data/history.json`; autoplay and `cvibe` never pick one within 48 h. Requested songs are never blocked. **No skip-learning:** the owner asked to remove it (it blocked good songs).
 - **Process priority:** above normal for the bot and ffmpeg.
 - **Leaving voice:** if the owner leaves while music plays, the bot leaves and keeps the queue for **3 minutes** (`FORGET_AFTER_MS` in `voice.js`). If the owner rejoins in time, music continues from the same spot. If not, the queue is cleared. On restart, a saved queue that's more than 3 minutes old with nobody listening is dropped too.
+- **`cseek` and `clyrics` were built, then removed at the owner's request (1 Nov). Don't add them back.** `reopen(seekSec)` still accepts a position (used internally).
+- **Volume / profile = hot swap (`MusicSession.reopen`):** the old stream keeps playing while the new one opens, then `audio.play()` swaps them in one step (no Idle, no gap). Volume is an ffmpeg `volume=` filter right before the limiter (`buildFilters` in `profiles.js`), saved as `settings.volume`. A fully downloaded song is kept in memory (`memory` from `waitForAudio`, cap 24 MB), so reopen doesn't re-download. **`-ss` must stay BEFORE `-i`** in `transcode()`: measured 0.1 s vs 7.5 s to seek to 2:00, because with `-ss` after `-i` the filters process the skipped audio.
 - **Link mode (`clink`):** per channel, saved in `settings.json` as `linkChannels`. It only triggers when the whole message is music links (`MUSIC_LINK_RE` in `commands.js`). Unapproved users are ignored silently.
 - **`net.setDefaultAutoSelectFamilyAttemptTimeout(1000)`:** Node's default of 250 ms caused "fetch failed" on the slow network.
 
@@ -132,6 +137,17 @@ Tested 31 Oct 2026. **✅ log** = confirmed in `bot.log`; **✅ owner** = owner 
 
 Session stats from the log: 0 stutters, 0 failed songs, no errors besides the login retries.
 
+**Stage 3 tests (pending):**
+
+| # | Test | Expected | Status |
+| --- | --- | --- | --- |
+| 21 | `cvolume 50`, then `cvolume 130`, then `cvolume +10` quickly 3 times | Music never stops; changes within about 1 s; card shows a `🔊 N%` chip; one re-open in the log, not several | ⏳ |
+| 22 | `csound bass` mid-song | Switches without stopping the music | ⏳ |
+| 26 | Pause, then `cvolume 80` | Applies and stays paused | ⏳ |
+| 27 | Play a song | Voice channel shows `🎵 Song · Artist`; bot profile shows "Listening to Song" | ⏳ |
+| 28 | `cstop`, or leave voice | Both statuses clear | ⏳ |
+| 29 | Let the queue run out with autoplay off | Music stops; One More Time / Tum Hi Ho never come back | ⏳ |
+
 Also pending for the owner:
 - [ ] Push Stage 2: `git add src README.md CONTEXT.md` → `git commit -m "Stage 2"` → `git push`
 - [ ] Reset the bot token and update `.env`
@@ -147,8 +163,9 @@ Also pending for the owner:
 | Sound | Profiles, YouTube Music search, `cping`, nettest | ✅ |
 | 2 | Spotify, smart autoplay, `cvibe` | ✅ tested |
 | 2+ | `clink`, 3-min queue expiry, same-language autoplay, 2-day no-repeat, D+ card, login retry | ✅ tested |
-| 3 | Effects (slowed + reverb, nightcore, 8D, lofi), `cvolume`, `cseek`, synced `clyrics` (LRCLIB) | ⬜ next |
-| 4 | `csave`/`cload` playlists, ❤️ liked songs, `chistory`, `ctop`/`cwrapped` stats, `csleep`, song name on the voice channel, "Listening to…" status | ⬜ |
+| 3 | `cvolume` (hot-swap, in-memory song) | ✅ built, ⏳ test in Discord. Effects, `cseek` and `clyrics` dropped at the owner's request. |
+| 4 | Song name on the voice channel, "Listening to…" status | ✅ built, ⏳ test |
+| 4 (rest) | `csave`/`cload` playlists, ❤️ liked songs, `chistory`, `ctop`/`cwrapped` stats, `csleep` | ⬜ |
 | Extra | `start-bot.bat` / start on boot for the laptop; optional YouTube Premium cookies for 256 kbps AAC | ⬜ |
 
 **Web player (future):** a built-in `node:http` server (no new dependencies) with a mobile-first page in the D+ style: cover, chips, big controls, search-to-play, queue editing, and live updates over Server-Sent Events. It calls the same `MusicSession` methods, so all the rules stay the same. Recommended setup: **Tailscale** for access from anywhere (never public) and a **secret link** sent by `cweb` in a DM, with a resettable key. Discord OAuth login, which would also let `cgrant` users in, can come later. Cloudflare Tunnel only with strong auth.

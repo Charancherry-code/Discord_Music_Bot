@@ -1,9 +1,4 @@
-// Turns user input or playlist.txt lines into track objects.
-import fs from 'node:fs/promises';
-import { statSync } from 'node:fs';
-import path from 'node:path';
-import { config, ROOT_DIR } from './config.js';
-import { log } from './logger.js';
+// Turns what someone typed (song name, YouTube/SoundCloud/Spotify link) into track objects.
 import { getSpotifyTracks, SPOTIFY_RE } from './spotify.js';
 import { fetchEntries, searchTracks } from './ytdlp.js';
 
@@ -69,39 +64,4 @@ export async function resolveInput(input, requester, signal) {
   }
   if (!results.length) throw new UserError(`No results for **${input.slice(0, 80)}**.`);
   return [makeTrack(results[0], requester)];
-}
-
-function lineToTrack(line) {
-  if (URL_RE.test(line)) return { title: line, url: line, requesterId: null, isDefault: true };
-
-  // Local files are only allowed from playlist.txt (which only the host owner can edit).
-  const local = path.resolve(ROOT_DIR, line);
-  try {
-    if (statSync(local).isFile()) {
-      return { title: path.basename(local), url: null, path: local, requesterId: null, isDefault: true };
-    }
-  } catch {
-    // Not a local file; treat it as a search phrase.
-  }
-  return { title: line, url: null, query: line, requesterId: null, isDefault: true };
-}
-
-/** Reads playlist.txt. Returns [] (and logs why) if it's missing or unreadable. */
-export async function loadDefaultPlaylist() {
-  try {
-    const text = await fs.readFile(config.playlistFile, 'utf8');
-    const tracks = text
-      .replace(/^\uFEFF/, '')
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith('#'))
-      .map(lineToTrack);
-    if (config.shuffle) shuffleInPlace(tracks);
-    log.info(`playlist.txt loaded: ${tracks.length} track(s).`);
-    return tracks;
-  } catch (err) {
-    const reason = err.code === 'ENOENT' ? 'file not found' : err.message;
-    log.warn(`Could not read ${config.playlistFile} (${reason}).`);
-    return [];
-  }
 }

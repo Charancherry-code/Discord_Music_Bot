@@ -9,9 +9,9 @@ import { log } from './logger.js';
 import { NowPlayingCard } from './nowplaying.js';
 import { Permissions } from './permissions.js';
 import { MusicSession } from './player.js';
-import { DEFAULT_PROFILE, encodeBitrate, getProfile, PROFILES } from './profiles.js';
+import { buildFilters, clampVolume, DEFAULT_PROFILE, encodeBitrate, getProfile, PROFILES } from './profiles.js';
 import { Resolver } from './resolver.js';
-import { loadDefaultPlaylist } from './sources.js';
+import { NowPlayingStatus } from './status.js';
 import { JsonStore } from './store.js';
 import { FORGET_AFTER_MS, VoiceManager } from './voice.js';
 import { checkFfmpeg, raisePriority } from './audio.js';
@@ -27,8 +27,8 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(1000);
 process.on('unhandledRejection', (err) => log.error('Unhandled rejection:', err));
 process.on('uncaughtException', (err) => log.error('Uncaught exception:', err));
 
-// View Channel, Send Messages, Embed Links, Read Message History, Connect, Speak
-const INVITE_PERMISSIONS = '3230720';
+// View Channel, Send Messages, Embed Links, Read Message History, Connect, Speak, Set Voice Channel Status
+const INVITE_PERMISSIONS = '281474979941376';
 const SESSION_SAVE_DELAY_MS = 2_000;
 const SESSION_SAVE_INTERVAL_MS = 15_000;
 const SESSION_MAX_AGE_MS = 6 * 60 * 60_000; // Don't auto-rejoin sessions older than this.
@@ -61,26 +61,20 @@ const resolver = new Resolver(config.cacheFile);
 const session = new MusicSession(resolver);
 const voice = new VoiceManager(client, session, settings);
 const card = new NowPlayingCard(client, session);
+const nowPlayingStatus = new NowPlayingStatus(client, session, voice);
 let commands = null;
 
 const autoplay = new Autoplay(session, settings, historyStore);
 
-// When the queue runs out: similar songs if autoplay is on, otherwise playlist.txt
-// (only in your channel, re-read each time).
-session.onQueueEnd = async () => {
-  if (session.autoplay && session.loop === 'off') {
-    const picks = await autoplay.next();
-    if (picks.length) return picks;
-  }
-  const botChannel = voice.channelId;
-  return botChannel && botChannel === voice.ownerChannelId() ? loadDefaultPlaylist() : [];
-};
+// When the queue runs out: similar songs if autoplay is on, otherwise stop.
+session.onQueueEnd = async () => (session.autoplay && session.loop === 'off' ? autoplay.next() : []);
 
 // Sound profile + encode bitrate for each track (bitrate follows the voice channel's setting).
 session.getAudioOptions = () => {
   const name = PROFILES[settings.data.soundProfile] ? settings.data.soundProfile : DEFAULT_PROFILE;
+  const volume = clampVolume(settings.data.volume ?? 100);
   const channel = voice.channelId ? client.channels.cache.get(voice.channelId) : null;
-  return { profile: name, filters: getProfile(name).filters, bitrate: encodeBitrate(channel?.bitrate) };
+  return { profile: name, volume, filters: buildFilters(name, volume), bitrate: encodeBitrate(channel?.bitrate) };
 };
 
 // ---------- resume after restart ----------
@@ -189,6 +183,7 @@ async function shutdown(signal) {
     clearTimeout(saveTimer);
     sessionStore.data = buildSnapshot(); // Saved before leaving so a restart resumes here.
     await Promise.allSettled([sessionStore.flush(), resolver.flush(), settings.flush(), permissionsStore.flush(), historyStore.flush()]);
+    await nowPlayingStatus.clear().catch(() => {});
     voice.leave();
     await client.destroy();
   } finally {

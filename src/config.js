@@ -43,11 +43,9 @@ export const config = Object.freeze({
   ownerId: required('OWNER_ID', SNOWFLAKE),
   guildId: required('GUILD_ID', SNOWFLAKE),
   prefix: (env('PREFIX') || 'c').toLowerCase(),
-  playlistFile: resolvePath(env('PLAYLIST_FILE') || 'playlist.txt'),
   cookiesFile: env('COOKIES_FILE') ? resolvePath(env('COOKIES_FILE')) : null,
   ytDlpPath: resolvePath(env('YTDLP_PATH') || path.join('bin', defaultBinaryName())),
   ytDlpAutoUpdate: bool('YTDLP_AUTO_UPDATE', true),
-  shuffle: bool('SHUFFLE', false),
   dataDir,
   cacheFile: path.join(ROOT_DIR, '.cache', 'resolved.json'),
 });

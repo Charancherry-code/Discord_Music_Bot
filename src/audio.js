@@ -7,7 +7,7 @@ import { createReadStream } from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { PassThrough } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import ffmpegPath from 'ffmpeg-static';
 import { createAudioResource, demuxProbe, StreamType } from '@discordjs/voice';
 import { log } from './logger.js';
@@ -37,6 +37,8 @@ const FIRST_BYTE_TIMEOUT_MS = 75_000;
 const PREBUFFER_BYTES = 128 * 1024;
 // Let yt-dlp keep downloading ahead of playback, up to about a whole song.
 const DOWNLOAD_AHEAD_BYTES = 16 * 1024 * 1024;
+// Songs up to this size are kept in memory for instant volume/seek (160 kbps ≈ 1.2 MB per minute).
+const MEMORY_CAP = 24 * 1024 * 1024;
 // FFMPEG_PATH lets you use a system ffmpeg if the bundled ffmpeg-static binary doesn't work on your host.
 const FFMPEG = process.env.FFMPEG_PATH?.trim() || ffmpegPath;
 
@@ -97,6 +99,11 @@ export function raisePriority(pid) {
   }
 }
 
+/** False if the startup check found ffmpeg broken (then volume, seek and profiles can't apply). */
+export function ffmpegAvailable() {
+  return ffmpegOk;
+}
+
 function kill(proc) {
   if (proc && proc.exitCode === null && proc.signalCode === null) {
     try {
@@ -118,6 +125,19 @@ function waitForAudio(child, signal) {
     stderr = (stderr + chunk).slice(-4000);
   });
   child.stdout.on('error', () => {});
+
+  // The whole song is also kept in memory (it's only a few MB), so volume, profile and seek
+  // changes can re-open it instantly without downloading it again.
+  const memory = { chunks: [], bytes: 0, complete: false };
+  child.stdout.on('data', (chunk) => {
+    if (!memory.chunks) return;
+    memory.bytes += chunk.length;
+    if (memory.bytes > MEMORY_CAP) memory.chunks = null; // unusually long upload: don't keep it
+    else memory.chunks.push(chunk);
+  });
+  child.stdout.once('end', () => {
+    memory.complete = Boolean(memory.chunks);
+  });
 
   return new Promise((resolve, reject) => {
     // Buffered chunks are kept in order here, then written to a fresh stream first,
@@ -163,7 +183,7 @@ function waitForAudio(child, signal) {
       out.write(head);
       if (child.stdout.readableEnded) out.end();
       else child.stdout.pipe(out); // keeps downloading ahead of playback
-      resolve({ stream: out, head });
+      resolve({ stream: out, head, memory });
     }
 
     child.stdout.on('data', onData);
@@ -181,13 +201,10 @@ function waitForAudio(child, signal) {
 function transcode({ input, file, seekSec = 0, filters = null, bitrate = 160_000 }) {
   if (!FFMPEG) throw new Error('no ffmpeg binary for this platform; install ffmpeg and set FFMPEG_PATH');
   const args = ['-hide_banner', '-loglevel', 'error'];
-  if (file) {
-    if (seekSec > 0) args.push('-ss', String(seekSec));
-    args.push('-i', file);
-  } else {
-    args.push('-i', 'pipe:0');
-    if (seekSec > 0) args.push('-ss', String(seekSec));
-  }
+  // -ss BEFORE -i: skipped audio is decoded and dropped before the filters run. With -ss after -i
+  // every filter processes the skipped part too (measured: 0.1 s vs 7.5 s to seek to 2:00).
+  if (seekSec > 0) args.push('-ss', String(seekSec));
+  args.push('-i', file ?? 'pipe:0');
   args.push('-vn');
   if (filters) args.push('-af', filters);
   args.push(
@@ -226,7 +243,10 @@ function transcode({ input, file, seekSec = 0, filters = null, bitrate = 160_000
  * Returns { resource, cleanup, passthrough }. `cleanup()` kills helper processes and must be
  * called once the track is finished or abandoned. The track needs either `url` or `path`.
  */
-export async function createTrackResource(track, { seekSec = 0, filters = null, bitrate = 160_000, signal } = {}) {
+export async function createTrackResource(
+  track,
+  { seekSec = 0, filters = null, bitrate = 160_000, signal, memory: reuse = null } = {},
+) {
   const procs = [];
   const cleanup = () => procs.forEach(kill);
   const onAbort = () => cleanup();
@@ -234,9 +254,11 @@ export async function createTrackResource(track, { seekSec = 0, filters = null, 
 
   // Resolves when the whole song has been downloaded (the next song's preload waits for this).
   let downloadDone = Promise.resolve();
+  let memory = null;
   const finalize = (stream, inputType, passthrough) => ({
     resource: createAudioResource(stream, { inputType, metadata: track }),
     downloadDone,
+    memory,
     cleanup,
     passthrough,
   });
@@ -263,18 +285,24 @@ export async function createTrackResource(track, { seekSec = 0, filters = null, 
 
     let source;
     let head;
-    {
+    if (reuse?.complete && reuse.chunks?.length) {
+      // Re-open from the copy in memory: no download, no yt-dlp, ready in well under a second.
+      memory = reuse;
+      source = Readable.from(reuse.chunks, { objectMode: false });
+      head = Buffer.concat(reuse.chunks.slice(0, 8)).subarray(0, 4096);
+    } else {
       if (!track.url) throw new Error('track has no URL');
       const needsInfo = track.duration == null || !track.author;
       const infoFile = needsInfo ? path.join(os.tmpdir(), `smb-${randomUUID()}.json`) : null;
       const child = spawnAudioStream(track.url, { infoFile });
       procs.push(child);
-      downloadDone = new Promise((resolve) => child.once('exit', resolve));
+      // 'close' fires after the output is fully read, so the in-memory copy is complete by then.
+      downloadDone = new Promise((resolve) => child.once('close', resolve));
       child.once('exit', (code) => {
         if (code) log.debug(`yt-dlp exited with code ${code} for ${track.url}`);
       });
       try {
-        ({ stream: source, head } = await waitForAudio(child, signal));
+        ({ stream: source, head, memory } = await waitForAudio(child, signal));
       } finally {
         if (infoFile) await applyInfoFile(track, infoFile);
       }

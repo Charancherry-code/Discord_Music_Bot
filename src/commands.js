@@ -1,13 +1,14 @@
 // Prefix commands (cplay, cskip, ...) and Now Playing button handling.
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, EmbedBuilder, MessageFlags } from 'discord.js';
 import { config } from './config.js';
+import { ffmpegAvailable } from './audio.js';
 import { cleanTitle, formatDuration, trackLabel } from './format.js';
 import { log } from './logger.js';
 import { COLORS } from './nowplaying.js';
 import { LOOP_MODES } from './player.js';
-import { PROFILES } from './profiles.js';
+import { clampVolume, MAX_VOLUME, PROFILES } from './profiles.js';
 import { VIBES } from './autoplay.js';
-import { loadDefaultPlaylist, makeTrack, resolveInput, UserError } from './sources.js';
+import { makeTrack, resolveInput, UserError } from './sources.js';
 import { searchTracks } from './ytdlp.js';
 
 const MSG_NO_PERMISSION = "🔒 You don't have permission to use this bot.";
@@ -27,6 +28,8 @@ function parsePositive(text) {
 
 export class CommandHandler {
   #lookup = new Map();
+
+  #reopenTimer = null;
 
   constructor({ session, voice, perms, settings, card, autoplay }) {
     this.autoplay = autoplay;
@@ -193,7 +196,7 @@ export class CommandHandler {
 
     const lines = upcoming
       .slice(p * QUEUE_PAGE_SIZE, (p + 1) * QUEUE_PAGE_SIZE)
-      .map((t, i) => `\`${p * QUEUE_PAGE_SIZE + i + 1}.\` ${trackLabel(t, 60)} \`${formatDuration(t.duration)}\`${t.autoplay ? ' 🎲' : t.isDefault ? ' 📄' : ''}`);
+      .map((t, i) => `\`${p * QUEUE_PAGE_SIZE + i + 1}.\` ${trackLabel(t, 60)} \`${formatDuration(t.duration)}\`${t.autoplay ? ' 🎲' : ''}`);
 
     const total = upcoming.reduce((sum, t) => sum + (t.duration ?? 0), 0);
     return new EmbedBuilder()
@@ -205,6 +208,18 @@ export class CommandHandler {
       .setFooter({
         text: `Page ${p + 1}/${pages} · ${upcoming.length} song(s) · ${formatDuration(total)} · Loop: ${s.loop}`,
       });
+  }
+
+  /**
+   * Applies new volume/profile settings to the playing song. Debounced, so `cvolume +10` typed
+   * five times quickly causes one re-open, not five. Returns false if nothing is playing.
+   */
+  #reopenSoon() {
+    const track = this.session.nowPlaying;
+    if (!track || track.live) return false;
+    clearTimeout(this.#reopenTimer);
+    this.#reopenTimer = setTimeout(() => this.session.reopen(), 700);
+    return true;
   }
 
   #linkChannels() {
@@ -253,12 +268,6 @@ export class CommandHandler {
     return ctx.reply(`➕ Added **${added}** songs to the queue.`, COLORS.playing);
   }
 
-  async #loadDefaultInto() {
-    const tracks = await loadDefaultPlaylist();
-    if (tracks.length) this.session.add(tracks);
-    return tracks.length;
-  }
-
   // ---------- command definitions ----------
 
   #definitions() {
@@ -270,15 +279,14 @@ export class CommandHandler {
         name: 'play',
         aliases: ['p'],
         usage: 'play <song name or link>',
-        description: 'Play a song or add it to the queue. With nothing after it, resumes or plays playlist.txt.',
+        description: 'Play a song or add it to the queue. With nothing after it, resumes the queue.',
         run: async (ctx) => {
+          if (!ctx.argText && !s.hasPending && s.isIdle) {
+            throw new UserError(`Nothing queued. Try \`${config.prefix}play <song>\` or \`${config.prefix}vibe\`.`);
+          }
           await v.ensureFor(ctx.member);
           s.textChannelId = ctx.message.channelId;
           if (!ctx.argText) {
-            if (!s.hasPending && s.isIdle) {
-              const count = await this.#loadDefaultInto();
-              if (!count) return ctx.reply('Nothing queued and playlist.txt is empty. Try `cplay <song>`.', COLORS.error);
-            }
             s.start();
             return ctx.reply('▶️ Playing.', COLORS.playing);
           }
@@ -531,9 +539,37 @@ export class CommandHandler {
           if (!PROFILES[wanted]) throw new UserError(`Unknown profile. Pick one of: ${Object.keys(PROFILES).join(', ')}.`);
           this.settings.data.soundProfile = wanted;
           this.settings.save();
-          const applied = s.reapplyAudio();
+          const applied = this.#reopenSoon();
           const p = PROFILES[wanted];
-          return ctx.reply(`${p.emoji} Sound profile: **${p.label}**. ${applied ? 'Applied now.' : 'Applies to the next song.'}`, COLORS.playing);
+          return ctx.reply(
+            `${p.emoji} Sound profile: **${p.label}**. ${applied ? 'Switching in a moment, without stopping the music.' : 'Applies to the next song.'}`,
+            COLORS.playing,
+          );
+        },
+      },
+      {
+        name: 'volume',
+        aliases: ['vol'],
+        usage: 'volume [0-150 | +10 | -10]',
+        description: 'Set the volume (saved). Above 100% uses a limiter so it never distorts. Changes without stopping the music.',
+        sameChannel: true,
+        run: (ctx) => {
+          const current = clampVolume(this.settings.data.volume ?? 100);
+          const arg = ctx.args[0]?.replace(/%$/, '');
+          if (!arg) return ctx.reply(`🔊 Volume: **${current}%**. Use \`${config.prefix}volume 0-${MAX_VOLUME}\`, \`+10\` or \`-10\`.`);
+          const n = Number(arg);
+          if (!Number.isFinite(n)) throw new UserError(`Usage: \`${config.prefix}volume 0-${MAX_VOLUME}\`, \`+10\` or \`-10\`.`);
+          if (!ffmpegAvailable()) throw new UserError("Volume needs ffmpeg, which isn't working on this machine.");
+          const value = clampVolume(/^[+-]/.test(arg) ? current + n : n);
+          if (value === current) return ctx.reply(`🔊 Volume is already **${value}%**.`);
+          this.settings.data.volume = value;
+          this.settings.save();
+          const applied = this.#reopenSoon();
+          const icon = value === 0 ? '🔇' : value < 50 ? '🔈' : value <= 100 ? '🔉' : '🔊';
+          return ctx.reply(
+            `${icon} Volume **${value}%**${value > 100 ? ' (boosted, limiter on)' : ''}. ${applied ? 'Changing in a moment, without stopping the music.' : 'Applies to the next song.'}`,
+            COLORS.playing,
+          );
         },
       },
       {

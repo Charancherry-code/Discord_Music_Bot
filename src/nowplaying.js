@@ -125,6 +125,8 @@ export class NowPlayingCard {
       chip(`Ln ${s.index + 1}/${s.tracks.length}`),
       chip(`⚡${ping >= 0 ? `${ping}ms` : 'n/a'}`),
     ];
+    const volume = s.audioOptions.volume ?? 100;
+    if (volume !== 100) row2.splice(2, 0, chip(`${volume === 0 ? '🔇' : '🔊'} ${volume}%`));
 
     const next = s.upcoming;
     const nextText = next.length

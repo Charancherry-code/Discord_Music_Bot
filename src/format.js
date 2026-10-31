@@ -32,9 +32,3 @@ export function trackLabel(track, max = 80) {
   const title = cleanTitle(track.title, max);
   return track.url?.startsWith('http') ? `[${title}](<${track.url}>)` : title;
 }
-
-/** Parses "90", "1:30" or "1:02:03" into seconds. Returns null if invalid. */
-export function parseTimestamp(text) {
-  if (!/^\d+(:\d{1,2}){0,2}$/.test(text ?? '')) return null;
-  return text.split(':').reduce((acc, part) => acc * 60 + Number(part), 0);
-}

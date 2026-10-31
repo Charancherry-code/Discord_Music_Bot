@@ -13,6 +13,31 @@ const MAX_QUEUE = 1000;
 
 export const LOOP_MODES = ['off', 'song', 'queue'];
 
+/** Resolves once `stream` has audio to read (so a swap never plays silence). */
+function waitReadable(stream, signal, timeoutMs) {
+  if (stream.readableLength > 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => done(new Error('no audio in time')), timeoutMs);
+    const onReadable = () => done();
+    const onError = (err) => done(err);
+    const onEnd = () => done(new Error('stream ended before any audio'));
+    const onAbort = () => done(new Error('aborted'));
+    function done(err) {
+      clearTimeout(timer);
+      stream.off('readable', onReadable);
+      stream.off('error', onError);
+      stream.off('end', onEnd);
+      signal?.removeEventListener('abort', onAbort);
+      if (err) reject(err);
+      else resolve();
+    }
+    stream.once('readable', onReadable);
+    stream.once('error', onError);
+    stream.once('end', onEnd);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 /**
  * Events:
  *  - 'trackStart' (track)   a new track began playing
@@ -36,7 +61,7 @@ export class MusicSession extends EventEmitter {
   /** Counters shown on the card: songs that failed to load, and stutters (late audio). */
   failedCount = 0;
   stutters = 0;
-  /** Set by the app: returns tracks to append when the queue runs out (e.g. playlist.txt). */
+  /** Set by the app: returns tracks to append when the queue runs out (autoplay picks). */
   onQueueEnd = null;
   /** Set by the app: returns { filters, bitrate } for the next track (sound profile, channel bitrate). */
   getAudioOptions = () => ({});
@@ -53,6 +78,10 @@ export class MusicSession extends EventEmitter {
   #prefetch = null; // { track, key, controller, promise } for the next song
   #prefetchTimer = null;
   #currentDownloaded = false;
+  #reopening = null; // AbortController of a running reopen() (volume, profile, seek)
+  // Running averages of how long a reopen takes (re-download vs from memory), used to line up the swap.
+  #reopenMs = 3_000;
+  #reopenMemoryMs = 500;
 
   constructor(resolver) {
     super();
@@ -139,7 +168,7 @@ export class MusicSession extends EventEmitter {
   // ---------- queue editing ----------
 
   /**
-   * Adds tracks to the queue. Songs people ask for go before any remaining playlist.txt songs.
+   * Adds tracks to the queue. Songs people ask for go before any queued autoplay picks.
    * Returns { added, position } where position 0 means "plays now" and N means "Nth in Up Next".
    */
   add(newTracks) {
@@ -147,8 +176,8 @@ export class MusicSession extends EventEmitter {
     const items = newTracks.slice(0, room);
     if (!items.length) return { added: 0, position: -1 };
 
-    // Requested songs jump ahead of filler (playlist.txt and autoplay picks).
-    const isFiller = (t) => t.isDefault || t.autoplay;
+    // Requested songs jump ahead of autoplay picks.
+    const isFiller = (t) => t.autoplay;
     const finished = this.index >= this.tracks.length;
     let insertAt = this.tracks.length;
     if (!finished && !isFiller(items[0])) {
@@ -212,6 +241,7 @@ export class MusicSession extends EventEmitter {
   /** Stops playback because the bot left voice. Keeps the queue and the position in the song. */
   halt() {
     if (this.audio.state.status !== AudioPlayerStatus.Idle) this.#resumeAt = Math.floor(this.positionSec);
+    this.#cancelReopen();
     this.active = false;
     this.#autoPaused = false;
     this.#pendingJump = null;
@@ -228,6 +258,7 @@ export class MusicSession extends EventEmitter {
 
   /** Stops playback and clears the whole queue. */
   stop() {
+    this.#cancelReopen();
     this.tracks = [];
     this.index = 0;
     this.#resumeAt = 0;
@@ -271,20 +302,66 @@ export class MusicSession extends EventEmitter {
     return true;
   }
 
-  /** Re-opens the current track at the same spot so a new sound profile takes effect right away. */
-  reapplyAudio() {
-    if (!this.nowPlaying || this.nowPlaying.live) return false;
+  /**
+   * Re-opens the current song with the latest audio options (volume, sound profile) or at a new
+   * position, WITHOUT stopping it first: the old stream keeps playing until the new one has audio
+   * ready, then the two swap in one step. No silence, no gap. Resolves true if the swap happened.
+   * @param {number} [seekSec] New position. Omitted = continue from here (volume/profile change).
+   */
+  async reopen(seekSec) {
+    const track = this.nowPlaying;
+    if (!track || track.live || !this.active) return false;
+    this.#cancelReopen();
+    const controller = new AbortController();
+    this.#reopening = controller;
+    const { signal } = controller;
+
     const wasPaused = this.isPaused;
-    this.seek(this.positionSec);
-    if (wasPaused) this.once('trackStart', () => this.pause());
+    const started = Date.now();
+    const fromMemory = Boolean(this.#current?.memory?.complete);
+    // Continuing: start the new stream where the song will be by the time it's ready.
+    const lead = seekSec === undefined && !wasPaused ? (fromMemory ? this.#reopenMemoryMs : this.#reopenMs) / 1000 : 0;
+    let target = Math.floor(seekSec ?? this.positionSec + lead);
+    if (track.duration) target = Math.min(target, Math.max(0, track.duration - 2));
+    const audioOptions = this.getAudioOptions();
+
+    let loaded = null;
+    try {
+      // Re-uses the song's in-memory copy when it's fully downloaded (instant), else downloads again.
+      loaded = await createTrackResource(track, { ...audioOptions, seekSec: target, signal, memory: this.#current?.memory });
+      await waitReadable(loaded.resource.playStream, signal, 30_000);
+    } catch (err) {
+      loaded?.cleanup();
+      if (!signal.aborted) log.warn(`Couldn't re-open "${track.title}": ${err.message}`);
+      if (this.#reopening === controller) this.#reopening = null;
+      return false;
+    }
+    if (signal.aborted || this.nowPlaying !== track || !this.active) {
+      loaded.cleanup();
+      return false;
+    }
+    this.#reopening = null;
+    if (seekSec === undefined) {
+      const took = Date.now() - started;
+      if (fromMemory) this.#reopenMemoryMs = Math.round(this.#reopenMemoryMs * 0.6 + took * 0.4);
+      else this.#reopenMs = Math.round(this.#reopenMs * 0.6 + took * 0.4);
+    }
+
+    const old = this.#current;
+    this.#current = { ...loaded, audioOptions };
+    this.#seekBase = target;
+    this.audio.play(loaded.resource); // replaces the old stream directly: no Idle state, no gap
+    old?.cleanup();
+    if (wasPaused) this.audio.pause();
+    this.#watchDownload(loaded, track);
+    log.info(`Re-opened "${track.title}" at ${target}s (${Date.now() - started}ms).`);
+    this.emit('change');
     return true;
   }
 
-  /** Restarts the current track at `seconds` (used by resume and, later, cseek). */
-  seek(seconds) {
-    if (!this.nowPlaying) return false;
-    this.#jump(this.index, Math.max(0, Math.floor(seconds)));
-    return true;
+  #cancelReopen() {
+    this.#reopening?.abort();
+    this.#reopening = null;
   }
 
   pause() {
@@ -333,9 +410,13 @@ export class MusicSession extends EventEmitter {
 
   restore(snap) {
     if (!Array.isArray(snap?.tracks)) return;
-    this.tracks = snap.tracks.slice(0, MAX_QUEUE);
-    this.index = Math.min(Math.max(0, snap.index | 0), this.tracks.length);
-    this.#resumeAt = Math.max(0, snap.position | 0);
+    const index = Math.max(0, snap.index | 0);
+    // Old saves may contain playlist.txt songs (that feature was removed): drop them.
+    const keep = snap.tracks.map((t, i) => ({ t, i })).filter(({ t }) => !t.isDefault);
+    const current = snap.tracks[index];
+    this.tracks = keep.map(({ t }) => t).slice(0, MAX_QUEUE);
+    this.index = Math.min(keep.filter(({ i }) => i < index).length, this.tracks.length);
+    this.#resumeAt = current && !current.isDefault ? Math.max(0, snap.position | 0) : 0;
     this.loop = LOOP_MODES.includes(snap.loop) ? snap.loop : 'off';
   }
 
@@ -347,6 +428,7 @@ export class MusicSession extends EventEmitter {
   }
 
   #jump(index, seekSec = 0) {
+    this.#cancelReopen();
     this.#clearNextTimer();
     this.#failures = 0;
     if (this.audio.state.status !== AudioPlayerStatus.Idle) {
@@ -419,7 +501,7 @@ export class MusicSession extends EventEmitter {
   }
 
   /**
-   * Turns playlist.txt search phrases into a URL (cached after the first time).
+   * Turns search phrases (Spotify songs) into a URL (cached after the first time).
    * Links need nothing here: the streaming yt-dlp run fills in title, artist and length.
    */
   async #prepare(track, signal) {
@@ -449,17 +531,33 @@ export class MusicSession extends EventEmitter {
     this.#prefetchTimer.unref();
   }
 
+  /** Preloads the next song once this one is fully downloaded (or after 2 minutes at most). */
+  #watchDownload(loaded, track) {
+    this.#currentDownloaded = false;
+    const current = this.#current;
+    const waitLimit = new Promise((resolve) => setTimeout(resolve, 120_000).unref());
+    Promise.race([loaded.downloadDone ?? Promise.resolve(), waitLimit]).then(() => {
+      if (this.#current !== current) return;
+      this.#currentDownloaded = true;
+      log.debug(`"${track.title}" fully downloaded.`);
+      this.#schedulePrefetch(1_000);
+    });
+  }
+
   #startPrefetch() {
-    if (!this.active || !this.nowPlaying || this.loop === 'song') return;
-    // Never let the next song's download compete with the current one on a slow connection.
-    if (!this.#currentDownloaded) return;
-    const next = this.tracks[this.index + 1] ?? (this.loop === 'queue' ? this.tracks[0] : null);
-    if (!next || next.live || next === this.nowPlaying) return;
+    if (!this.active || !this.nowPlaying) return;
+    const next = this.loop === 'song' ? null : this.tracks[this.index + 1] ?? (this.loop === 'queue' ? this.tracks[0] : null);
+    if (!next || next.live || next === this.nowPlaying) {
+      this.#dropPrefetch();
+      return;
+    }
 
     const audioOptions = this.getAudioOptions();
     const key = JSON.stringify(audioOptions);
-    if (this.#prefetch?.track === next && this.#prefetch.key === key) return;
-    this.#dropPrefetch();
+    if (this.#prefetch?.track === next && this.#prefetch.key === key) return; // already preloaded
+    this.#dropPrefetch(); // preloaded the wrong song, or with old settings
+    // Never let the next song's download compete with the current one on a slow connection.
+    if (!this.#currentDownloaded) return;
 
     const controller = new AbortController();
     const entry = { track: next, key, controller, promise: null };
@@ -474,11 +572,14 @@ export class MusicSession extends EventEmitter {
     log.debug(`Preloading "${next.title}".`);
   }
 
-  /** Returns the preload for `track` if it matches, otherwise discards any preload. */
+  /**
+   * Returns the preload if it's for `track` with the same settings. A preload for another song is
+   * left alone (#startPrefetch replaces it when it's no longer needed).
+   */
   #takePrefetch(track, audioOptions, seekSec) {
     const p = this.#prefetch;
-    if (!p) return null;
-    if (p.track !== track || seekSec > 0 || p.key !== JSON.stringify(audioOptions)) {
+    if (!p || p.track !== track) return null;
+    if (seekSec > 0 || p.key !== JSON.stringify(audioOptions)) {
       this.#dropPrefetch();
       return null;
     }
@@ -554,17 +655,7 @@ export class MusicSession extends EventEmitter {
       log.info(`Now playing: ${track.title}${loaded.passthrough ? '' : ' (ffmpeg)'}`);
       this.emit('trackStart', track);
       this.emit('change');
-
-      // Preload the next song only after this one is fully downloaded (or after 2 minutes at most).
-      this.#currentDownloaded = false;
-      const current = this.#current;
-      const waitLimit = new Promise((resolve) => setTimeout(resolve, 120_000).unref());
-      Promise.race([loaded.downloadDone ?? Promise.resolve(), waitLimit]).then(() => {
-        if (this.#current !== current) return;
-        this.#currentDownloaded = true;
-        log.debug(`"${track.title}" fully downloaded.`);
-        this.#schedulePrefetch(1_000);
-      });
+      this.#watchDownload(loaded, track);
     } catch (err) {
       if (signal.aborted) return;
       this.#loading = null;

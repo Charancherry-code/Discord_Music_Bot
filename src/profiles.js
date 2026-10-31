@@ -39,6 +39,22 @@ export function getProfile(name) {
   return PROFILES[name] ?? PROFILES[DEFAULT_PROFILE];
 }
 
+export const MAX_VOLUME = 150;
+
+export const clampVolume = (v) => Math.round(Math.min(MAX_VOLUME, Math.max(0, Number.isFinite(v) ? v : 100)));
+
+/**
+ * The ffmpeg filter chain for a profile at a volume. Volume goes right before the limiter, so a
+ * boost above 100% gets louder without ever clipping. At 100% the chain is unchanged (and the
+ * "pure" profile stays untouched passthrough).
+ */
+export function buildFilters(name, volume = 100) {
+  const base = getProfile(name).filters;
+  if (volume === 100) return base;
+  const vol = `volume=${(volume / 100).toFixed(2)}`;
+  return base ? base.replace(LIMITER, `${vol},${LIMITER}`) : `${vol},${LIMITER}`;
+}
+
 // Opus at 160 kbps matches YouTube's best audio. Boosted channels allow more.
 export const MIN_ENCODE_BITRATE = 160_000;
 export const MAX_ENCODE_BITRATE = 384_000;

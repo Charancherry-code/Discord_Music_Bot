@@ -1,4 +1,4 @@
-// Turns search phrases (from playlist.txt) into YouTube tracks once, then remembers
+// Turns search phrases (Spotify songs) into YouTube tracks once, then remembers
 // them on disk so each phrase is only searched the first time it's played.
 import { log } from './logger.js';
 import { JsonStore } from './store.js';

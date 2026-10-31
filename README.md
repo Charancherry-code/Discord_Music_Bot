@@ -2,7 +2,7 @@
 
 A private, Jockie-style music bot for one server. It follows you between voice channels, plays full-quality audio, and only you and the people you approve can control it.
 
-**Status:** Stages 1 and 2 of 4 are done: playback, queue, buttons, permissions, follow mode, resume after restart, sound profiles, Spotify links, smart autoplay and vibe radio. Effects, lyrics and stats come next.
+**Status:** Stages 1–3 are done: playback, queue, buttons, permissions, follow mode, resume after restart, sound profiles, Spotify links, smart autoplay, vibe radio and volume. Saved playlists and stats come next.
 
 ## Spotify links
 
@@ -21,17 +21,23 @@ When the last queued song starts playing, autoplay picks a similar song from **Y
 - **Stays in the same language.** It guesses each song's language (Telugu, Hindi, Tamil, Punjabi, Kannada, Malayalam, Bengali, Marathi, English) from its script, words like "Telugu" or "Bollywood", and well-known channels and artists. The last 3 songs decide. Picks in that language come first, songs it can't place come next, and songs clearly in another language are never picked. If a Mix has drifted away, it searches for songs in that language instead.
 - `cvibe telugu` (and the other language vibes) locks autoplay to that language until someone requests a song.
 - Songs people request always play before autoplay picks (marked 🎲 in `cqueue`).
-- With loop on, autoplay waits. With autoplay off, the queue falls back to `playlist.txt` in your channel.
+- With loop on, autoplay waits. With autoplay off, the music stops when the queue runs out.
+
+## Song name on the voice channel and profile
+
+While a song plays, the bot shows it in two places, updated only when the song changes:
+- **Voice channel status:** `🎵 Song · Artist` under the channel name in the sidebar. It clears when the music stops or the bot moves. The bot needs the **Set Voice Channel Status** permission (Server Settings → Roles → the bot's role); without it, this part is skipped and logged once.
+- **Bot profile:** "Listening to *Song*".
 
 ## Rules
 
 | Situation | What the bot does |
 | --- | --- |
-| You join or switch voice channels (follow on) | It follows you. If the queue is empty, it plays `playlist.txt`. |
+| You join or switch voice channels (follow on) | It follows you, silently. Music only continues if it was already playing. |
 | You're in voice | Only you can control it. Everyone else gets "Busy with the owner". |
 | You're not in voice | Users you approved can use `cplay` and it joins their channel. |
 | You leave voice | It leaves too (if it was with you). The queue is kept. |
-| The queue runs out while you're listening | It goes back to `playlist.txt`, re-reading the file. |
+| The queue runs out | Autoplay adds similar songs; with autoplay off, the music stops. |
 | Everyone leaves its channel | It pauses, then resumes when someone returns. After 5 minutes alone, it leaves. |
 | Nothing has played for 5 minutes in someone else's channel | It leaves. |
 | The host restarts the bot | It rejoins and continues the same song from the same spot. |
@@ -42,7 +48,7 @@ Prefix is `c`. Aliases are in brackets.
 
 | Command | What it does |
 | --- | --- |
-| `cplay <song / link>` [`cp`] | Play or queue a song name, YouTube or SoundCloud link, or playlist link. `cplay` with nothing after it resumes, or plays `playlist.txt`. |
+| `cplay <song / link>` [`cp`] | Play or queue a song name, YouTube or SoundCloud link, or playlist link. `cplay` with nothing after it resumes the queue. |
 | `csearch <song>` [`cfind`] | Top 5 results with pick buttons |
 | `cskip` [`cs`, `cnext`] | Skip |
 | `cskipto <n>` [`cst`, `cjump`] | Jump to song n in the queue |
@@ -56,6 +62,7 @@ Prefix is `c`. Aliases are in brackets.
 | `cclear` | Clear Up Next |
 | `cshuffle` [`csh`] | Shuffle Up Next |
 | `cloop [off/song/queue]` [`crepeat`] | Set the loop mode. With nothing after it, cycles through the modes. |
+| `cvolume [0-150 / +10 / -10]` [`cvol`] | Set the volume (saved across restarts). Above 100% a limiter stops distortion. The change happens without stopping the music. |
 | `clink` [`clinkmode`] | Toggle **link mode** in this channel. While it's on, a message that's only YouTube, Spotify or SoundCloud links (up to 10) plays them like `cplay`. Messages with other text are ignored, and so are people without access. The setting survives restarts. |
 | `cautoplay [on/off]` [`cap`, `cauto`] | Keep playing similar songs when the queue runs out (on by default). The 🎲 button on the card toggles it too. |
 | `cvibe <mood>` [`cradio`, `cmood`] | Endless radio: chill, romantic, sad, party, gym, punjabi, telugu, tamil, english, focus. `cvibe` alone lists them. |
@@ -72,7 +79,7 @@ People without access who type a short alias (like `cs`) are ignored silently, s
 
 ### Now Playing card
 
-The card is one message that gets edited in place. Its buttons are ⏮ ⏯ ⏭ ⏹ / 🔁 🔀 📜, and the footer shows the sound profile and bitrate. The progress bar updates every 15 seconds. When the bot follows you and plays `playlist.txt`, the card goes in the voice channel's built-in text chat. Otherwise it goes where `cplay` was used.
+The card is one message that gets edited in place. Its buttons are ⏮ ⏯ ⏭ ⏹ / 🔁 🔀 📜, and the footer shows the sound profile and bitrate. The progress bar updates every 15 seconds. The card goes in the channel where `cplay` was used.
 
 ## Setup
 
@@ -98,29 +105,15 @@ npm start
 
 On first start, the bot prints an invite link if it isn't in your server yet. If you invited the first version, invite it again with the new link: it now needs Send Messages, Embed Links and Read Message History.
 
-## playlist.txt
-
-One entry per line. `#` starts a comment.
-
-```text
-Daft Punk - One More Time               <- searched on YouTube
-https://www.youtube.com/watch?v=...     <- any link yt-dlp supports
-music/my-song.mp3                       <- local file, relative to the project folder
-```
-
-Songs people ask for with `cplay` always go before the remaining `playlist.txt` songs.
-
 ## Saved data
 
-Everything lives in `data/`: `permissions.json`, `settings.json` (follow mode) and `session.json` (queue for resume). Search results for `playlist.txt` are cached in `.cache/resolved.json`.
+Everything lives in `data/`: `permissions.json`, `settings.json` (follow mode, sound profile, volume, autoplay, link-mode channels), `session.json` (queue for resume) and `history.json` (the 2-day no-repeat list). Spotify song searches are cached in `.cache/resolved.json`.
 
 ## Optional settings (.env)
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PREFIX` | `c` | Command prefix |
-| `PLAYLIST_FILE` | `playlist.txt` | Default playlist |
-| `SHUFFLE` | `false` | Shuffle `playlist.txt` each time it loads |
 | `COOKIES_FILE` | none | YouTube cookies (see below) |
 | `YTDLP_PATH` | `bin/yt-dlp` | Use your own yt-dlp |
 | `YTDLP_AUTO_UPDATE` | `true` | Run `yt-dlp -U` on startup |
