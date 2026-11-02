@@ -1,5 +1,6 @@
-// Smart autoplay: when the queue is about to run out, add a similar song from YouTube's Mix
-// for the current song. It avoids repeats and compilations, and stays in the same language.
+// Smart autoplay: when the queue is about to run out, add a similar song. Candidates come from
+// YouTube's Mix and YouTube Music's song radio, then are scored: same language first, clean audio
+// uploads over music videos, a little artist variety. No repeats for 2 days, no compilations.
 //
 // The next pick is added while the current song is still playing (not after it ends),
 // so the player can preload it and the change of song is seamless.
@@ -16,20 +17,52 @@ const MIX_CACHE_SIZE = 30;
 const MIX_CACHE_TTL_MS = 30 * 60_000;
 const MIN_SEC = 90;
 const MAX_SEC = 600; // longer than 10 min is usually a jukebox or album upload
-const PICK_FROM_TOP = 5; // random among the most relevant few, for variety
+const PICK_FROM_TOP = 3; // random among the best-scored few, for variety
 const RETRY_AFTER_FAIL_MS = 60_000;
+const SAME_ARTIST_WINDOW = 2; // soft penalty for an artist heard in the last 2 songs
 
 // Uploads that aren't one clean song.
 const NOT_A_SONG =
-  /\b(jukebox|nonstop|non-stop|mashup|full album|top\s*\d+|best of|\d+\s*(hours?|hrs?)\b|compilation|playlist|karaoke|reaction|slowed|reverb|8d|sped up|ringtone|status)\b/i;
-const NOISE = /\b(official|video|audio|lyrics?|lyrical|full song|music video|hd|4k|remaster(ed)?|visualizer)\b/gi;
+  /\b(jukebox|nonstop|non-stop|mashup|full album|top\s*\d+|best of|\d+\s*(hours?|hrs?)\b|compilation|playlist|karaoke|reaction|slowed|reverb|8d|sped up|ringtone|status|cover|bass ?boosted)\b/i;
+// Video-style uploads: often start with dialogue or a long intro, so the plain audio upload is preferred.
+const VIDEO_STYLE =
+  /\b(full video|full song|video song|official (music )?video|music video|lyrical|lyric video|lyrics video|teaser|trailer|promo|4k|8k|hd video)\b/i;
+const NOISE = /\b(official|video|audio|lyrics?|lyrical|full song|music video|video song|hd|4k|8k|remaster(ed)?|visualizer|title (song|track))\b/gi;
 
-/** Comparable song name: "Tum Hi Ho (Official Video) | Aashiqui 2" -> "tumhiho". */
-export function songKey(title) {
-  return String(title ?? '')
+const norm = (s) => String(s ?? '').toLowerCase().replace(/\s+-\s+topic$/, '').replace(/[^\p{L}\p{N}]+/gu, '');
+
+/** Main artist of an upload: "Arijit Singh, Pritam" -> "arijitsingh"; for "The Weeknd - X" titles, "theweeknd". */
+function artistKey(entry) {
+  const dash = String(entry?.title ?? '').match(/^(.{2,40}?)\s+-\s+/);
+  const name = String(entry?.author ?? '').split(/\s*(?:,|&|\bx\b|\bfeat\.?|\bft\.?)\s*/i)[0] || dash?.[1];
+  return norm(name).replace(/vevo$/, '');
+}
+
+/**
+ * Comparable song name, the same for every upload of a song:
+ * "Tum Hi Ho (Official Video) | Aashiqui 2" -> "tumhiho",
+ * "The Weeknd - Blinding Lights (Official Video)" -> "blindinglights",
+ * "Lyrical: Tum Hi Aana | Marjaavaan" -> "tumhiaana".
+ */
+export function songKey(title, author) {
+  let t = String(title ?? '').replace(/^\s*(lyrical|lyrics|full video)\s*:\s*/i, '');
+  const quoted = t.match(/^\s*"([^"]{2,60})"/); // "Kabira Full Song" Yeh Jawaani Hai Deewani
+  if (quoted) t = quoted[1];
+  t = t.split(/\s[|•]\s/)[0];
+  // "Artist - Song": drop the artist part when it names the uploader, or when the title has one dash.
+  const dash = t.match(/^(.+?)\s+-\s+(.+)$/);
+  if (dash) {
+    const left = norm(dash[1]);
+    const a = norm(author);
+    if (!a || left.includes(a) || a.includes(left) || !dash[2].includes(' - ')) t = dash[2];
+  }
+  return t
     .toLowerCase()
-    .split(/\s[|•]\s/)[0]
+    .replace(/\s+/g, ' ')
+    // "Chahun Main Ya Naa Full Video Song Aashiqui 2": the movie name follows the label.
+    .replace(/\s(full video song|full video|video song|full song|title (song|track))\b.*$/, '')
     .replace(/[([{].*?[)\]}]/g, ' ')
+    .replace(/\b(ft|feat|featuring)\b\.?.*$/i, ' ')
     .replace(NOISE, ' ')
     .replace(/[^\p{L}\p{N}]+/gu, '');
 }
@@ -48,9 +81,19 @@ export const VIBES = {
   focus: { emoji: '🎧', search: 'instrumental focus music', language: null },
 };
 
+/** [a1, a2, ...] + [b1, b2, ...] -> [a1, b1, a2, b2, ...], so both lists' best picks rank first. */
+function interleave(lists) {
+  const out = [];
+  for (let i = 0; i < Math.max(...lists.map((l) => l.length)); i++) {
+    for (const list of lists) if (list[i]) out.push(list[i]);
+  }
+  return out;
+}
+
 export class Autoplay {
   #recentIds = [];
   #recentLanguages = []; // detected language of played songs (null = unknown)
+  #recentArtists = [];
   #lockedLanguage = null; // set by cvibe; cleared when someone requests a song
   #mixCache = new Map(); // key -> { entries, at }
   #busy = null;
@@ -147,47 +190,85 @@ export class Autoplay {
     });
   }
 
+  /**
+   * Finds the next song. Each step runs only if the one before found nothing usable:
+   *   1. YouTube's Mix + YouTube Music radio of the current song (fetched in parallel)
+   *   2. the same for the last two songs
+   *   3. more songs by the current artist
+   *   4. a search for hit songs in the current language
+   */
   async #pick() {
     const language = this.language;
-
-    // 1. Mixes of the current and recent songs, same-language picks first.
+    const sources = [];
     for (const seed of this.#seeds()) {
-      const pick = this.#choose(await this.#cached(seed, () => fetchMix(seed)), language);
-      if (pick) return [pick];
+      sources.push({
+        label: 'mix',
+        load: async () => {
+          const [mix, radio] = await Promise.allSettled([
+            this.#cached(`mix:${seed}`, () => fetchMix(seed, 'mix')),
+            this.#cached(`radio:${seed}`, () => fetchMix(seed, 'radio')),
+          ]);
+          const lists = [mix, radio].filter((r) => r.status === 'fulfilled').map((r) => r.value);
+          if (!lists.length) throw mix.reason ?? radio.reason;
+          return interleave(lists);
+        },
+      });
     }
-
-    // 2. The Mixes only had other languages: search for songs in this language instead.
+    const artist = this.session.nowPlaying?.author?.replace(/\s+-\s+topic$/i, '').split(/\s*,\s*/)[0];
+    if (artist) sources.push({ label: `${artist} search`, load: () => this.#cached(`artist:${norm(artist)}`, () => searchTracks(`${artist} songs`, 15)) });
     if (language) {
       const query = Object.values(VIBES).find((v) => v.language === language)?.search ?? `${language} hit songs`;
-      const pick = this.#choose(await this.#cached(`search:${language}`, () => searchTracks(query, 15)), language);
+      sources.push({ label: `${language} search`, load: () => this.#cached(`lang:${language}`, () => searchTracks(query, 15)) });
+    }
+
+    let lastError = null;
+    for (const [i, source] of sources.entries()) {
+      let entries;
+      try {
+        entries = await source.load();
+      } catch (err) {
+        lastError = err;
+        continue; // one failed source shouldn't stop autoplay
+      }
+      const pick = this.#choose(entries, language);
       if (pick) {
-        log.info(`Autoplay: the Mix drifted away from ${language}; picked from a ${language} search.`);
+        if (i > 0) log.info(`Autoplay: used the ${source.label} (earlier sources had nothing new).`);
         return [pick];
       }
     }
+    if (lastError) throw lastError;
     return [];
   }
 
   /**
-   * Chooses one entry: songs detected as the same language first, then songs of unknown language.
-   * Songs clearly in another language are never picked while a language is known.
+   * Scores every usable entry and picks randomly among the best few.
+   * Never picks a song clearly in another language while a language is known.
    */
   #choose(entries, language) {
-    const fresh = entries.filter((e) => this.#acceptable(e));
-    let pool = fresh;
-    if (language) {
-      const same = [];
-      const unknown = [];
-      for (const e of fresh) {
-        const lang = detectLanguage(e);
-        if (lang === language) same.push(e);
-        else if (!lang) unknown.push(e);
-      }
-      pool = [...same, ...unknown];
+    const recentArtists = this.#recentArtists.slice(-SAME_ARTIST_WINDOW);
+    const scored = [];
+    const seen = new Set();
+    for (const [rank, e] of entries.entries()) {
+      if (!this.#acceptable(e)) continue;
+      const key = songKey(e.title, e.author);
+      if (key && seen.has(key)) continue; // the same song listed twice (video + audio upload)
+      if (key) seen.add(key);
+
+      const lang = detectLanguage(e);
+      if (language && lang && lang !== language) continue;
+
+      let score = rank; // YouTube's order is the base: lower is better
+      if (language && lang === language) score -= 8;
+      if (VIDEO_STYLE.test(e.title ?? '')) score += 6; // prefer clean audio uploads
+      if (/\s-\s+topic$/i.test(e.author ?? '') || /\((official )?audio\)/i.test(e.title ?? '')) score -= 3;
+      const artist = artistKey(e);
+      if (artist && recentArtists.includes(artist)) score += 5; // some variety, never a hard block
+      scored.push({ e, score });
     }
-    if (!pool.length) return null;
-    const pick = pool[Math.floor(Math.random() * Math.min(PICK_FROM_TOP, pool.length))];
-    return { ...makeTrack(pick, null), autoplay: true };
+    if (!scored.length) return null;
+    scored.sort((a, b) => a.score - b.score);
+    const { e } = scored[Math.floor(Math.random() * Math.min(PICK_FROM_TOP, scored.length))];
+    return { ...makeTrack(e, null), autoplay: true };
   }
 
   /** Video IDs to base the pick on: the current song first, then recent ones. */
@@ -219,7 +300,7 @@ export class Autoplay {
   #acceptable(entry) {
     const id = youtubeId(entry.url);
     if (!id) return false;
-    if (this.#playedRecently(id, songKey(entry.title))) return false; // same song or another upload of it
+    if (this.#playedRecently(id, songKey(entry.title, entry.author))) return false; // same song or another upload of it
     if (NOT_A_SONG.test(entry.title ?? '')) return false;
     if (entry.duration && (entry.duration < MIN_SEC || entry.duration > MAX_SEC)) return false;
     return true;
@@ -227,7 +308,7 @@ export class Autoplay {
 
   #remember(track) {
     const id = youtubeId(track.url);
-    const key = songKey(track.title);
+    const key = songKey(track.title, track.author);
     const now = Date.now();
     const played = this.#played;
     if (id) played[`id:${id}`] = now;
@@ -242,7 +323,8 @@ export class Autoplay {
 
     if (id) this.#recentIds.push(id);
     this.#recentLanguages.push(detectLanguage(track));
-    for (const list of [this.#recentIds, this.#recentLanguages]) {
+    this.#recentArtists.push(artistKey(track));
+    for (const list of [this.#recentIds, this.#recentLanguages, this.#recentArtists]) {
       if (list.length > HISTORY_SIZE) list.shift();
     }
   }

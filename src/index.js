@@ -1,4 +1,4 @@
-import { config } from './config.js';
+import { config, EXIT_FATAL } from './config.js';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
@@ -16,8 +16,9 @@ import { JsonStore } from './store.js';
 import { FORGET_AFTER_MS, VoiceManager } from './voice.js';
 import { checkFfmpeg, raisePriority } from './audio.js';
 import { Autoplay } from './autoplay.js';
-import { ensureYtDlp } from './ytdlp-install.js';
-import { updateYtDlp } from './ytdlp.js';
+import { Library } from './library.js';
+import { Stats } from './stats.js';
+import { ensureYtDlp, updateYtDlp, ytDlpPath } from './ytdlp-install.js';
 
 // Node tries IPv6 and IPv4 in parallel, giving each only 250 ms by default. On slow networks
 // that makes connections fail ("fetch failed"); 1 s is still fast but much more reliable.
@@ -32,6 +33,7 @@ const INVITE_PERMISSIONS = '281474979941376';
 const SESSION_SAVE_DELAY_MS = 2_000;
 const SESSION_SAVE_INTERVAL_MS = 15_000;
 const SESSION_MAX_AGE_MS = 6 * 60 * 60_000; // Don't auto-rejoin sessions older than this.
+const YTDLP_UPDATE_EVERY_MS = 24 * 60 * 60_000;
 
 const client = new Client({
   intents: [
@@ -56,6 +58,9 @@ const settings = new JsonStore(path.join(config.dataDir, 'settings.json'), { fol
 const permissionsStore = new JsonStore(path.join(config.dataDir, 'permissions.json'), { users: [], roles: [] });
 const sessionStore = new JsonStore(path.join(config.dataDir, 'session.json'), {});
 const historyStore = new JsonStore(path.join(config.dataDir, 'history.json'), { played: {} });
+const libraryStore = new JsonStore(path.join(config.dataDir, 'library.json'), { playlists: {}, liked: {} });
+const statsStore = new JsonStore(path.join(config.dataDir, 'stats.json'), { songs: {}, plays: [] });
+const stores = [settings, permissionsStore, sessionStore, historyStore, libraryStore, statsStore];
 
 const resolver = new Resolver(config.cacheFile);
 const session = new MusicSession(resolver);
@@ -65,6 +70,8 @@ const nowPlayingStatus = new NowPlayingStatus(client, session, voice);
 let commands = null;
 
 const autoplay = new Autoplay(session, settings, historyStore);
+const library = new Library(libraryStore);
+const stats = new Stats(session, statsStore);
 
 // When the queue runs out: similar songs if autoplay is on, otherwise stop.
 session.onQueueEnd = async () => (session.autoplay && session.loop === 'off' ? autoplay.next() : []);
@@ -182,7 +189,7 @@ async function shutdown(signal) {
   try {
     clearTimeout(saveTimer);
     sessionStore.data = buildSnapshot(); // Saved before leaving so a restart resumes here.
-    await Promise.allSettled([sessionStore.flush(), resolver.flush(), settings.flush(), permissionsStore.flush(), historyStore.flush()]);
+    await Promise.allSettled([resolver.flush(), ...stores.map((s) => s.flush())]);
     await nowPlayingStatus.clear().catch(() => {});
     voice.leave();
     await client.destroy();
@@ -192,6 +199,12 @@ async function shutdown(signal) {
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+// From scripts/supervisor.js (Windows has no SIGTERM between processes, so it asks over IPC).
+process.on('message', (msg) => {
+  if (msg === 'shutdown') shutdown('Supervisor stop');
+});
+// The supervisor was killed: quit too, so a new supervisor can start a fresh copy.
+process.on('disconnect', () => shutdown('Supervisor gone'));
 
 // ---------- startup ----------
 
@@ -210,7 +223,7 @@ function acquireSingleInstanceLock() {
       }
       if (alive) {
         log.error(`Another copy of the bot is already running (process ${pid}). Close it first, then start again.`);
-        process.exit(1);
+        process.exit(EXIT_FATAL);
       }
     }
   } catch {
@@ -232,13 +245,18 @@ async function main() {
   log.debug(`\n${generateDependencyReport()}`);
 
   try {
-    await ensureYtDlp(config.ytDlpPath, log);
-    if (config.ytDlpAutoUpdate) await updateYtDlp();
+    await ensureYtDlp(log);
+    log.info(`yt-dlp: ${path.relative(process.cwd(), ytDlpPath())}`);
+    if (config.ytDlpAutoUpdate) {
+      await updateYtDlp(log);
+      // The bot can run for weeks (start on boot), and YouTube changes often break old yt-dlp versions.
+      setInterval(() => updateYtDlp(log), YTDLP_UPDATE_EVERY_MS).unref();
+    }
   } catch (err) {
     log.error(`yt-dlp is unavailable (${err.message}). The bot can join voice but can't stream until this is fixed.`);
   }
 
-  await Promise.all([resolver.load(), settings.load(), permissionsStore.load(), sessionStore.load(), historyStore.load()]);
+  await Promise.all([resolver.load(), ...stores.map((s) => s.load())]);
 
   // Test ffmpeg with the real filter chains so a broken binary or filter can't silence every song.
   const ff = await checkFfmpeg(getProfile('bass').filters);
@@ -251,7 +269,7 @@ async function main() {
     );
   }
   session.autoplay = settings.data.autoplay !== false; // on unless you turned it off
-  commands = new CommandHandler({ session, voice, perms: new Permissions(permissionsStore), settings, card, autoplay });
+  commands = new CommandHandler({ session, voice, perms: new Permissions(permissionsStore), settings, card, autoplay, library, stats });
 
   // Network problems are retried forever (with backoff); a bad token or intent stops the bot.
   for (let attempt = 1; ; attempt++) {
@@ -261,11 +279,11 @@ async function main() {
     } catch (err) {
       if (/disallowed intents/i.test(err.message)) {
         log.error('Login failed: turn on "Message Content Intent" in the Developer Portal (Bot page), then restart.');
-        process.exit(1);
+        process.exit(EXIT_FATAL);
       }
       if (/token/i.test(err.message) || err.code === 'TokenInvalid') {
         log.error(`Login failed: ${err.message}. Check DISCORD_TOKEN.`);
-        process.exit(1);
+        process.exit(EXIT_FATAL);
       }
       const waitSec = Math.min(60, 5 * attempt);
       log.warn(`Can't reach Discord (${err.message}). Retrying in ${waitSec}s (attempt ${attempt}).`);

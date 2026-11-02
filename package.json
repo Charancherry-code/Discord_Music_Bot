@@ -10,6 +10,12 @@
   },
   "scripts": {
     "start": "node src/index.js",
+    "bot:install": "node scripts/service.js install",
+    "bot:uninstall": "node scripts/service.js uninstall",
+    "bot:start": "node scripts/service.js start",
+    "bot:stop": "node scripts/service.js stop",
+    "bot:restart": "node scripts/service.js restart",
+    "bot:status": "node scripts/service.js status",
     "postinstall": "node scripts/install-ytdlp.js",
     "install-ytdlp": "node scripts/install-ytdlp.js",
     "setup-server": "node scripts/setup-server.js",

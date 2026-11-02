@@ -1,7 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { defaultBinaryName } from './ytdlp-install.js';
+
+/** Exit code for problems a restart can't fix (bad token, bad .env, already running). The supervisor doesn't restart on it. */
+export const EXIT_FATAL = 78;
 
 export const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -44,7 +46,6 @@ export const config = Object.freeze({
   guildId: required('GUILD_ID', SNOWFLAKE),
   prefix: (env('PREFIX') || 'c').toLowerCase(),
   cookiesFile: env('COOKIES_FILE') ? resolvePath(env('COOKIES_FILE')) : null,
-  ytDlpPath: resolvePath(env('YTDLP_PATH') || path.join('bin', defaultBinaryName())),
   ytDlpAutoUpdate: bool('YTDLP_AUTO_UPDATE', true),
   dataDir,
   cacheFile: path.join(ROOT_DIR, '.cache', 'resolved.json'),
@@ -52,5 +53,5 @@ export const config = Object.freeze({
 
 if (problems.length) {
   console.error(`Configuration error:\n  - ${problems.join('\n  - ')}\nCopy .env.example to .env and fill it in.`);
-  process.exit(1);
+  process.exit(EXIT_FATAL);
 }

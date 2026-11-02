@@ -10,8 +10,9 @@ import path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
 import ffmpegPath from 'ffmpeg-static';
 import { createAudioResource, demuxProbe, StreamType } from '@discordjs/voice';
+import { readCached, writeCached } from './audiocache.js';
 import { log } from './logger.js';
-import { lastLine, parseInfoLine, spawnAudioStream } from './ytdlp.js';
+import { lastLine, parseInfoLine, spawnAudioStream, youtubeId } from './ytdlp.js';
 
 /** Fills in duration/artist/cover that quick search results leave out, from yt-dlp's info file. */
 async function applyInfoFile(track, infoFile) {
@@ -32,9 +33,10 @@ async function applyInfoFile(track, infoFile) {
 
 // Slow connections plus YouTube's JS challenge can take a while before the first audio byte.
 const FIRST_BYTE_TIMEOUT_MS = 75_000;
-// Wait for this much audio before playing (about 6 s at 160 kbps). Downloading keeps running ahead
-// of playback after that (several times faster than real time), so the buffer keeps growing.
-const PREBUFFER_BYTES = 128 * 1024;
+// Wait for this much audio before playing (about 13 s at 160 kbps), so a network hiccup right
+// after the start can't cause a stutter. At 40 Mbps this costs about 50 ms. Downloading keeps
+// running ahead of playback after that (many times faster than real time).
+const PREBUFFER_BYTES = 256 * 1024;
 // Let yt-dlp keep downloading ahead of playback, up to about a whole song.
 const DOWNLOAD_AHEAD_BYTES = 16 * 1024 * 1024;
 // Songs up to this size are kept in memory for instant volume/seek (160 kbps ≈ 1.2 MB per minute).
@@ -240,13 +242,18 @@ function transcode({ input, file, seekSec = 0, filters = null, bitrate = 160_000
 }
 
 /**
- * Returns { resource, cleanup, passthrough }. `cleanup()` kills helper processes and must be
- * called once the track is finished or abandoned. The track needs either `url` or `path`.
+ * Returns { resource, cleanup, passthrough, origin, firstAudioMs }. `origin` is where the audio
+ * came from: 'memory' (re-open), 'cache' (disk), 'download' (yt-dlp) or 'file' (local).
+ * `cleanup()` kills helper processes and must be called once the track is finished or abandoned.
+ * The track needs either `url` or `path`.
  */
 export async function createTrackResource(
   track,
   { seekSec = 0, filters = null, bitrate = 160_000, signal, memory: reuse = null } = {},
 ) {
+  const started = Date.now();
+  let origin = 'file';
+  let firstAudioMs = 0;
   const procs = [];
   const cleanup = () => procs.forEach(kill);
   const onAbort = () => cleanup();
@@ -261,6 +268,8 @@ export async function createTrackResource(
     memory,
     cleanup,
     passthrough,
+    origin,
+    firstAudioMs,
   });
 
   // Without a working ffmpeg, play untouched from the start rather than fail.
@@ -283,21 +292,34 @@ export async function createTrackResource(
       return finalize(probe.stream, probe.type, true);
     }
 
+    const videoId = track.live ? null : youtubeId(track.url);
+    if (!reuse?.complete && videoId) {
+      const cached = await readCached(videoId);
+      if (cached) {
+        reuse = { chunks: [cached], bytes: cached.length, complete: true };
+        origin = 'cache';
+      }
+    }
+
     let source;
     let head;
     if (reuse?.complete && reuse.chunks?.length) {
-      // Re-open from the copy in memory: no download, no yt-dlp, ready in well under a second.
+      // From memory (re-open) or the disk cache: no download, no yt-dlp, ready in milliseconds.
+      if (origin !== 'cache') origin = 'memory';
       memory = reuse;
       source = Readable.from(reuse.chunks, { objectMode: false });
       head = Buffer.concat(reuse.chunks.slice(0, 8)).subarray(0, 4096);
+      firstAudioMs = Date.now() - started;
     } else {
       if (!track.url) throw new Error('track has no URL');
+      origin = 'download';
       const needsInfo = track.duration == null || !track.author;
       const infoFile = needsInfo ? path.join(os.tmpdir(), `smb-${randomUUID()}.json`) : null;
       const child = spawnAudioStream(track.url, { infoFile });
       procs.push(child);
       // 'close' fires after the output is fully read, so the in-memory copy is complete by then.
-      downloadDone = new Promise((resolve) => child.once('close', resolve));
+      const closed = new Promise((resolve) => child.once('close', resolve));
+      downloadDone = closed.then(() => {});
       child.once('exit', (code) => {
         if (code) log.debug(`yt-dlp exited with code ${code} for ${track.url}`);
       });
@@ -306,6 +328,12 @@ export async function createTrackResource(
       } finally {
         if (infoFile) await applyInfoFile(track, infoFile);
       }
+      firstAudioMs = Date.now() - started;
+      // Cache only downloads that finished successfully (exit code 0), never a cut-off song.
+      const downloaded = memory;
+      closed.then((code) => {
+        if (code === 0 && downloaded.complete && videoId) writeCached(videoId, downloaded.chunks);
+      });
     }
     signal?.throwIfAborted();
 

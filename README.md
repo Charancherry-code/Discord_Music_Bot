@@ -2,7 +2,7 @@
 
 A private, Jockie-style music bot for one server. It follows you between voice channels, plays full-quality audio, and only you and the people you approve can control it.
 
-**Status:** Stages 1–3 are done: playback, queue, buttons, permissions, follow mode, resume after restart, sound profiles, Spotify links, smart autoplay, vibe radio and volume. Saved playlists and stats come next.
+**Status:** Stages 1–4 are done: playback, queue, buttons, permissions, follow mode, resume after restart, sound profiles, Spotify links, smart autoplay, vibe radio, volume, saved playlists, liked songs, listening stats and a sleep timer.
 
 ## Spotify links
 
@@ -14,11 +14,14 @@ A private, Jockie-style music bot for one server. It follows you between voice c
 
 ## Autoplay
 
-When the last queued song starts playing, autoplay picks a similar song from **YouTube's Mix** for it and queues it, so it preloads and plays without a gap.
+When the last queued song starts playing, autoplay picks a similar song and queues it, so it preloads and plays without a gap.
+
+- **Where picks come from**, in order, each used only if the one before had nothing new: **YouTube's Mix and YouTube Music's song radio** for the current song (fetched together and merged), the same for the 2 songs before it, more songs by the current artist, then a search for hit songs in the current language.
+- **How it chooses:** YouTube's order is the base. Same-language songs move up, clean audio uploads (Topic channels, "(Audio)") beat "Full Video"/"Lyrical" uploads that start with dialogue or long intros, and an artist heard in the last 2 songs moves down a little for variety. It picks randomly among the best 3. The video and audio uploads of one song count as the same song.
 
 - **Never repeats a song within 2 days**, including other uploads of the same song. The history is saved in `data/history.json`, so it survives restarts. Songs you ask for with `cplay`, `clink` or `csearch` always play.
 - Skips and compilations, jukeboxes, covers, slowed/8D edits and anything shorter than 90 s or longer than 10 min.
-- **Stays in the same language.** It guesses each song's language (Telugu, Hindi, Tamil, Punjabi, Kannada, Malayalam, Bengali, Marathi, English) from its script, words like "Telugu" or "Bollywood", and well-known channels and artists. The last 3 songs decide. Picks in that language come first, songs it can't place come next, and songs clearly in another language are never picked. If a Mix has drifted away, it searches for songs in that language instead.
+- **Stays in the same language.** It guesses each song's language (Telugu, Hindi, Tamil, Punjabi, Kannada, Malayalam, Bengali, Marathi, English) from its script, words like "Telugu" or "Bollywood", well-known labels and artists (also when they're named in the title, like "The Weeknd - …" or "… | Arijit Singh"), and for Hindi and English, common words ("tum", "dil", "hai" vs "the", "you", "my"). The last 3 songs decide. Picks in that language come first, songs it can't place come next, and songs clearly in another language are never picked. If a Mix has drifted away, it searches for songs in that language instead.
 - `cvibe telugu` (and the other language vibes) locks autoplay to that language until someone requests a song.
 - Songs people request always play before autoplay picks (marked 🎲 in `cqueue`).
 - With loop on, autoplay waits. With autoplay off, the music stops when the queue runs out.
@@ -66,6 +69,16 @@ Prefix is `c`. Aliases are in brackets.
 | `clink` [`clinkmode`] | Toggle **link mode** in this channel. While it's on, a message that's only YouTube, Spotify or SoundCloud links (up to 10) plays them like `cplay`. Messages with other text are ignored, and so are people without access. The setting survives restarts. |
 | `cautoplay [on/off]` [`cap`, `cauto`] | Keep playing similar songs when the queue runs out (on by default). The 🎲 button on the card toggles it too. |
 | `cvibe <mood>` [`cradio`, `cmood`] | Endless radio: chill, romantic, sad, party, gym, punjabi, telugu, tamil, english, focus. `cvibe` alone lists them. |
+| `csave <name>` [`csavepl`] | Save the current song and Up Next as a playlist (autoplay picks are left out). Saving under the same name replaces it. Up to 50 playlists of 500 songs. |
+| `cload <name> [shuffle]` [`cloadpl`] | Queue a saved playlist, optionally shuffled |
+| `cplaylists [name]` [`cpls`] | List playlists, or the songs in one |
+| `cdelpl <name>` [`cdeleteplaylist`, `cunsave`] | Delete a playlist. Only its creator or the owner can replace or delete it. |
+| `clike` [`clove`, `cfav`] | Like the current song, or unlike it. The ❤️ button on the card does the same. Each person has their own list. |
+| `cliked [play/shuffle/page]` [`clikes`, `cfavs`] | Show your liked songs; `cliked play` queues them, `cliked shuffle` in random order |
+| `chistory [page]` [`chist`, `crecent`] | Recently played songs |
+| `ctop [today/week/month/year/all]` [`cmostplayed`] | Top 10 songs and top 5 artists (all time by default) |
+| `cwrapped [today/week/month/year/all]` [`cstats`] | Listening summary: time listened, plays, song of the period, top artist, languages, top 5s (last 30 days by default) |
+| `csleep <30m / 1h / 1h30m / off>` [`ctimer`] | Stop the music, clear the queue and leave voice after a while (1 min to 12 h). `csleep` alone shows the time left; the card shows ☾ with the minutes left. |
 | `csound [pure/hifi/bass/vocal]` [`cprofile`, `ceq`] | Pick the sound profile. It applies right away, from the same spot in the song. |
 | `cping` [`clatency`, `cnet`] | Network check: Discord gateway, message round trip, voice ping and how long the last song took to start |
 | `chelp` [`ccommands`] | List commands |
@@ -77,9 +90,13 @@ Prefix is `c`. Aliases are in brackets.
 
 People without access who type a short alias (like `cs`) are ignored silently, so normal chat doesn't trigger replies. Full command names get a "no permission" reply.
 
+Commands that don't control playback (`clike`, `cliked`, `csave`, `cplaylists`, `cdelpl`, `chistory`, `ctop`, `cwrapped`, and the ❤️ and 📜 buttons) work for approved users even while the owner is in voice. `cliked play` and `cload` follow the normal rule.
+
+**Stats:** a song counts as played once it has been heard for 30 seconds (or half of it, for very short songs), not counting paused time. Skipped songs before that don't count. Artists come from the channel name; for label uploads (T-Series, Saregama, ...) the "Artist - Song" part of the title is used.
+
 ### Now Playing card
 
-The card is one message that gets edited in place. Its buttons are ⏮ ⏯ ⏭ ⏹ / 🔁 🔀 📜, and the footer shows the sound profile and bitrate. The progress bar updates every 15 seconds. The card goes in the channel where `cplay` was used.
+The card is one message that gets edited in place. Its buttons are ⏮ ⏯ ⏭ ⏹ / 🔁 🔀 🎲 📜 ❤️, and the footer shows the sound profile and bitrate. The progress bar updates every 15 seconds. The card goes in the channel where `cplay` was used.
 
 ## Setup
 
@@ -107,7 +124,7 @@ On first start, the bot prints an invite link if it isn't in your server yet. If
 
 ## Saved data
 
-Everything lives in `data/`: `permissions.json`, `settings.json` (follow mode, sound profile, volume, autoplay, link-mode channels), `session.json` (queue for resume) and `history.json` (the 2-day no-repeat list). Spotify song searches are cached in `.cache/resolved.json`.
+Everything lives in `data/`: `permissions.json`, `settings.json` (follow mode, sound profile, volume, autoplay, link-mode channels), `session.json` (queue for resume), `history.json` (the 2-day no-repeat list), `library.json` (playlists and liked songs) and `stats.json` (plays for `chistory`, `ctop` and `cwrapped`; the newest 20,000 are kept). Spotify song searches are cached in `.cache/resolved.json`.
 
 ## Optional settings (.env)
 
@@ -120,6 +137,7 @@ Everything lives in `data/`: `permissions.json`, `settings.json` (follow mode, s
 | `FFMPEG_PATH` | bundled | Use your own ffmpeg |
 | `DATA_DIR` | `data` | Where saved data goes |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
+| `AUDIO_CACHE_MB` | `1024` | Size of the song cache in `.cache/audio` (about 250 songs per GB). `0` turns it off. |
 
 ## If YouTube blocks the bot
 
@@ -130,6 +148,17 @@ The error looks like **"Sign in to confirm you're not a bot"**. To fix it:
 3. Save the file as `cookies.txt` next to `package.json` and set `COOKIES_FILE=cookies.txt`.
 
 Re-export the cookies when the error returns. SoundCloud links and local files aren't affected.
+
+## Speed and logs
+
+- **Song cache:** every fully downloaded song is saved in `.cache/audio`. Playing it again (liked songs, playlists, replays, rejoining) skips YouTube completely and starts in about 50 ms instead of about 10 s. The least recently played songs are removed when the cache is full.
+- **Preloading:** the next song is downloaded while the current one plays, so skips and song changes take a few milliseconds.
+- **Start buffer:** 256 KB (about 13 s of audio) before playback starts, so a network hiccup right after the start can't cause a stutter.
+- **Logs:** `logs/bot-YYYY-MM-DD.log`, kept 7 days, so they survive restarts. Each "Now playing" line says where the audio came from and how long the start took, e.g. `[download, 9707 ms]`, `[preloaded from download, 4 ms]` or `[cache, 45 ms]`.
+- **Telling the two kinds of stutter apart:**
+  - `Stutter: audio data arrived late` means the problem was on the laptop (slow download or busy CPU).
+  - `Voice network slow: … UDP ping` means the network between the laptop and Discord was slow.
+  - Every 5 minutes of playback, a `Voice network (5 min)` line shows the average, minimum and maximum voice ping.
 
 ## Sound quality
 

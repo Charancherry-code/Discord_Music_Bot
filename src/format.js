@@ -32,3 +32,18 @@ export function trackLabel(track, max = 80) {
   const title = cleanTitle(track.title, max);
   return track.url?.startsWith('http') ? `[${title}](<${track.url}>)` : title;
 }
+
+/** "just now", "5m ago", "3h ago", "2d ago". */
+export function timeAgo(at) {
+  const sec = Math.max(0, (Date.now() - at) / 1000);
+  if (sec < 60) return 'just now';
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+  if (sec < 86_400) return `${Math.floor(sec / 3600)}h ago`;
+  return `${Math.floor(sec / 86_400)}d ago`;
+}
+
+/** Listening time: "45m", "12h 5m". */
+export function formatListening(seconds) {
+  const min = Math.round((seconds ?? 0) / 60);
+  return min >= 60 ? `${Math.floor(min / 60)}h ${min % 60}m` : `${min}m`;
+}

@@ -14,6 +14,11 @@ import { UserError } from './sources.js';
 const OWNER_SYNC_DELAY_MS = 500; // Debounce for quick channel hopping.
 const READY_TIMEOUT_MS = 20_000;
 const RECONNECT_GRACE_MS = 5_000;
+// Voice network monitor: samples the UDP ping to Discord's voice server while music plays.
+// The stutter detector in player.js only sees the laptop side; this shows the network side.
+const NET_SAMPLE_MS = 10_000;
+const NET_REPORT_MS = 5 * 60_000;
+const NET_SLOW_MS = 250;
 const EMPTY_LEAVE_MS = 5 * 60_000;
 export const FORGET_AFTER_MS = 3 * 60_000; // after you leave voice, the queue is kept this long
 const IDLE_LEAVE_MS = 5 * 60_000;
@@ -34,6 +39,9 @@ export class VoiceManager {
   #resumeOnRejoin = false;
   #forgetTimer = null;
   #pendingSync = false;
+  #netSamples = [];
+  #netReportAt = Date.now();
+  #netWarnAt = 0;
 
   constructor(client, session, settings) {
     this.client = client;
@@ -42,6 +50,27 @@ export class VoiceManager {
 
     session.on('idle', () => this.#startIdleTimer());
     session.on('trackStart', () => this.#clearIdleTimer());
+    setInterval(() => this.#sampleNetwork(), NET_SAMPLE_MS).unref();
+  }
+
+  /** Logs slow voice pings right away, and a min/avg/max summary every 5 minutes of playback. */
+  #sampleNetwork() {
+    const udp = this.connection?.ping?.udp;
+    if (udp == null || !this.session.nowPlaying) return;
+    const now = Date.now();
+    this.#netSamples.push(udp);
+    if (udp > NET_SLOW_MS && now - this.#netWarnAt > 60_000) {
+      this.#netWarnAt = now;
+      log.warn(`Voice network slow: ${udp} ms UDP ping to Discord (audio may stutter for listeners). Cause: the network, not the bot.`);
+    }
+    if (now - this.#netReportAt < NET_REPORT_MS) return;
+    const s = this.#netSamples;
+    const avg = Math.round(s.reduce((a, b) => a + b, 0) / s.length);
+    const sorted = [...s].sort((a, b) => a - b);
+    const jitter = sorted.at(-1) - sorted[0];
+    log.info(`Voice network (5 min): UDP ping avg ${avg} ms, min ${sorted[0]} ms, max ${sorted.at(-1)} ms (${jitter} ms spread, ${s.length} samples).`);
+    this.#netSamples = [];
+    this.#netReportAt = now;
   }
 
   get guild() {

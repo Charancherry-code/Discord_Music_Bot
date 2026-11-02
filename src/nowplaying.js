@@ -127,6 +127,7 @@ export class NowPlayingCard {
     ];
     const volume = s.audioOptions.volume ?? 100;
     if (volume !== 100) row2.splice(2, 0, chip(`${volume === 0 ? '🔇' : '🔊'} ${volume}%`));
+    if (s.sleepAt) row2.push(chip(`☾ ${Math.max(1, Math.ceil((s.sleepAt - Date.now()) / 60_000))}m`));
 
     const next = s.upcoming;
     const nextText = next.length
@@ -174,6 +175,7 @@ export class NowPlayingCard {
       btn('shuffle', '🔀', ButtonStyle.Secondary, next.length < 2),
       btn('autoplay', '🎲', s.autoplay ? ButtonStyle.Success : ButtonStyle.Secondary),
       btn('queue', '📜'),
+      btn('like', '❤️'),
     );
     return { embeds: [embed], components: [buttons1, buttons2] };
   }

@@ -61,6 +61,8 @@ export class MusicSession extends EventEmitter {
   /** Counters shown on the card: songs that failed to load, and stutters (late audio). */
   failedCount = 0;
   stutters = 0;
+  /** When the sleep timer stops the music (ms timestamp), or null. Set by `csleep`. */
+  sleepAt = null;
   /** Set by the app: returns tracks to append when the queue runs out (autoplay picks). */
   onQueueEnd = null;
   /** Set by the app: returns { filters, bitrate } for the next track (sound profile, channel bitrate). */
@@ -114,7 +116,7 @@ export class MusicSession extends EventEmitter {
       if (missed > 0 && Date.now() - lastReport > 10_000) {
         lastReport = Date.now();
         this.stutters++;
-        log.warn(`Stutter: audio data arrived late (${missed} missed frames). Cause: slow download or busy CPU.`);
+        log.warn(`Stutter: audio data arrived late (${missed} missed frames). Cause: on this laptop (slow download or busy CPU), not the voice network.`);
       }
     }, 1_000).unref();
   }
@@ -635,8 +637,8 @@ export class MusicSession extends EventEmitter {
       if (pre) {
         signal.addEventListener('abort', () => pre.controller.abort(), { once: true });
         loaded = await pre.promise.catch(() => null);
-        if (loaded) log.debug(`Using preloaded "${track.title}".`);
       }
+      const usedPreload = Boolean(loaded);
       if (!loaded) {
         signal.throwIfAborted();
         await this.#prepare(track, signal);
@@ -652,7 +654,10 @@ export class MusicSession extends EventEmitter {
       this.#current = { ...loaded, audioOptions };
       this.#seekBase = seekSec;
       this.audio.play(loaded.resource);
-      log.info(`Now playing: ${track.title}${loaded.passthrough ? '' : ' (ffmpeg)'}`);
+      // Timing for the logs: where the audio came from and how long the start took.
+      const how = usedPreload ? `preloaded from ${loaded.origin}` : loaded.origin;
+      const timing = how === 'download' ? `${this.lastLoadMs} ms, first audio after ${loaded.firstAudioMs} ms` : `${this.lastLoadMs} ms`;
+      log.info(`Now playing: ${track.title}${loaded.passthrough ? '' : ' (ffmpeg)'} [${how}, ${timing}]`);
       this.emit('trackStart', track);
       this.emit('change');
       this.#watchDownload(loaded, track);

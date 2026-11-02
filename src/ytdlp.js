@@ -2,6 +2,7 @@ import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { config } from './config.js';
 import { log } from './logger.js';
+import { ytDlpPath } from './ytdlp-install.js';
 
 let warnedMissingCookies = false;
 
@@ -44,7 +45,7 @@ export function lastLine(text) {
 function run(args, { timeoutMs = 45_000, signal, raw = false } = {}) {
   return new Promise((resolve, reject) => {
     execFile(
-      config.ytDlpPath,
+      ytDlpPath(),
       raw ? args : [...baseArgs(), ...args],
       { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, windowsHide: true, signal },
       (err, stdout, stderr) => {
@@ -112,9 +113,14 @@ export function youtubeId(url) {
   return String(url ?? '').match(/(?:[?&]v=|youtu\.be\/|\/shorts\/|\/embed\/)([\w-]{11})/)?.[1] ?? null;
 }
 
-/** YouTube's "Mix" for a video: the same similar-songs list YouTube autoplays. */
-export function fetchMix(videoId, signal) {
-  return fetchEntries(`https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`, { limit: 30, signal, playlist: true });
+/**
+ * Similar songs for a video.
+ *   'mix'   = YouTube's Mix (what youtube.com autoplays): wide variety of artists.
+ *   'radio' = YouTube Music's song radio: more official-audio uploads, fewer music videos.
+ */
+export function fetchMix(videoId, kind = 'mix', signal) {
+  const list = kind === 'radio' ? `RDAMVM${videoId}` : `RD${videoId}`;
+  return fetchEntries(`https://www.youtube.com/watch?v=${videoId}&list=${list}`, { limit: 30, signal, playlist: true });
 }
 
 /**
@@ -143,7 +149,7 @@ export async function searchTracks(query, count = 1, signal) {
 export function spawnAudioStream(url, { infoFile } = {}) {
   const infoArgs = infoFile ? ['--print-to-file', INFO_TEMPLATE, infoFile] : [];
   const child = spawn(
-    config.ytDlpPath,
+    ytDlpPath(),
     [
       ...baseArgs(),
       ...infoArgs,
@@ -163,13 +169,4 @@ export function spawnAudioStream(url, { infoFile } = {}) {
   // A permanent handler so a late spawn error can never crash the process.
   child.on('error', (err) => log.debug('yt-dlp process error:', err.message));
   return child;
-}
-
-export async function updateYtDlp() {
-  try {
-    const out = await run(['-U'], { timeoutMs: 120_000, raw: true });
-    log.info(`yt-dlp: ${lastLine(out) || 'update check done'}`);
-  } catch (err) {
-    log.warn(`yt-dlp self-update skipped: ${err.message}`);
-  }
 }

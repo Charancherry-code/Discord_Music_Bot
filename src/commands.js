@@ -2,18 +2,23 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, EmbedBuilder, MessageFlags } from 'discord.js';
 import { config } from './config.js';
 import { ffmpegAvailable } from './audio.js';
-import { cleanTitle, formatDuration, trackLabel } from './format.js';
+import { cleanTitle, formatDuration, formatListening, timeAgo, trackLabel } from './format.js';
+import { toTracks } from './library.js';
+import { PERIODS } from './stats.js';
 import { log } from './logger.js';
 import { COLORS } from './nowplaying.js';
 import { LOOP_MODES } from './player.js';
 import { clampVolume, MAX_VOLUME, PROFILES } from './profiles.js';
 import { VIBES } from './autoplay.js';
-import { makeTrack, resolveInput, UserError } from './sources.js';
+import { makeTrack, resolveInput, shuffleInPlace, UserError } from './sources.js';
 import { searchTracks } from './ytdlp.js';
 
 const MSG_NO_PERMISSION = "🔒 You don't have permission to use this bot.";
 const MSG_BUSY = '🎧 Busy with the owner. Try again when they leave voice.';
 const QUEUE_PAGE_SIZE = 10;
+const LIST_PAGE_SIZE = 15;
+const MAX_SLEEP_MIN = 12 * 60;
+const PERIOD_LABELS = { today: 'today', week: 'the last 7 days', month: 'the last 30 days', year: 'the last 365 days', all: 'all time' };
 const MAX_LINKS_PER_MESSAGE = 10;
 // Music links that link mode reacts to.
 const MUSIC_LINK_RE =
@@ -26,13 +31,31 @@ function parsePositive(text) {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 
+/** "30" / "30m" / "1h" / "1h30m" / "1.5h" -> minutes, or null. */
+function parseMinutes(text) {
+  const t = text.toLowerCase().replace(/\s+/g, '');
+  if (/^\d+(\.\d+)?$/.test(t)) return Number(t);
+  const m = t.match(/^(?:(\d+(?:\.\d+)?)h(?:ours?|rs?)?)?(?:(\d+)m(?:in(?:ute)?s?)?)?$/);
+  if (!m || (!m[1] && !m[2])) return null;
+  return Number(m[1] ?? 0) * 60 + Number(m[2] ?? 0);
+}
+
+/** Splits trailing "shuffle" off a name: "gym mix shuffle" -> { name: "gym mix", shuffle: true }. */
+function nameAndShuffle(text) {
+  const m = text.match(/^(.*?)\s+(shuffle|sh)$/i);
+  return m ? { name: m[1].trim(), shuffle: true } : { name: text.trim(), shuffle: false };
+}
+
 export class CommandHandler {
   #lookup = new Map();
 
   #reopenTimer = null;
+  #sleepTimer = null;
 
-  constructor({ session, voice, perms, settings, card, autoplay }) {
+  constructor({ session, voice, perms, settings, card, autoplay, library, stats }) {
     this.autoplay = autoplay;
+    this.library = library;
+    this.stats = stats;
     this.session = session;
     this.voice = voice;
     this.perms = perms;
@@ -47,13 +70,17 @@ export class CommandHandler {
 
   // ---------- access rules ----------
 
-  /** Returns a denial message, or null if `member` may use the bot right now. */
-  #deny(member, { ownerOnly = false } = {}) {
+  /**
+   * Returns a denial message, or null if `member` may use the bot right now.
+   * `anytime` commands don't control playback (likes, stats, lists), so approved users
+   * can use them even while the owner is in voice.
+   */
+  #deny(member, { ownerOnly = false, anytime = false } = {}) {
     const isOwner = member?.id === config.ownerId;
     if (ownerOnly && !isOwner) return '🔒 Only the bot owner can use this command.';
     if (isOwner) return null;
     if (!this.perms.isApproved(member)) return MSG_NO_PERMISSION;
-    if (this.voice.ownerInVoice()) return MSG_BUSY;
+    if (!anytime && this.voice.ownerInVoice()) return MSG_BUSY;
     return null;
   }
 
@@ -127,7 +154,7 @@ export class CommandHandler {
         .catch((err) => log.warn(`Button reply failed: ${err.message}`));
 
     const member = interaction.member ?? (await interaction.guild?.members.fetch(interaction.user.id).catch(() => null));
-    const denied = this.#deny(member);
+    const denied = this.#deny(member, { anytime: action === 'queue' || action === 'like' });
     if (denied) return ephemeral(denied);
 
     if (action === 'queue') {
@@ -135,20 +162,27 @@ export class CommandHandler {
         .reply({ embeds: [this.#queueEmbed(0)], flags: MessageFlags.Ephemeral })
         .catch((err) => log.warn(`Button reply failed: ${err.message}`));
     }
+    if (action === 'like') {
+      const track = this.session.nowPlaying;
+      if (!track) return ephemeral('Nothing is playing.');
+      return ephemeral(this.#toggleLike(member.id, track), COLORS.playing);
+    }
 
     const problem = this.voice.checkSameChannel(member);
     if (problem) return ephemeral(problem);
 
-    // Acknowledge right away: Discord shows "This interaction failed" after 3 seconds without it.
-    try {
-      await interaction.deferUpdate();
-    } catch (err) {
-      log.warn(`Button "${action}" could not be acknowledged: ${err.message}`);
-      return;
-    }
-    // After acknowledging: private follow-up messages.
-    const notice = (text) =>
-      interaction.followUp({ embeds: [embed(text, COLORS.error)], flags: MessageFlags.Ephemeral }).catch(() => {});
+    // Acknowledge in parallel and act right away: on a slow network the acknowledgement can miss
+    // Discord's 3-second window, but the skip/pause itself should still happen.
+    const ack = interaction.deferUpdate().then(
+      () => true,
+      (err) => {
+        log.warn(`Button "${action}" could not be acknowledged: ${err.message}`);
+        return false;
+      },
+    );
+    const notice = async (text) => {
+      if (await ack) interaction.followUp({ embeds: [embed(text, COLORS.error)], flags: MessageFlags.Ephemeral }).catch(() => {});
+    };
 
     const s = this.session;
     try {
@@ -178,6 +212,7 @@ export class CommandHandler {
         default:
           return;
       }
+      await ack;
       await this.card.refreshNow();
     } catch (err) {
       log.error(`Button ${action} failed:`, err);
@@ -220,6 +255,60 @@ export class CommandHandler {
     clearTimeout(this.#reopenTimer);
     this.#reopenTimer = setTimeout(() => this.session.reopen(), 700);
     return true;
+  }
+
+  #toggleLike(userId, track) {
+    const liked = this.library.toggleLike(userId, track);
+    return liked
+      ? `❤️ Added ${trackLabel(track, 60)} to your liked songs. \`${config.prefix}liked\` to see them.`
+      : `💔 Removed ${trackLabel(track, 60)} from your liked songs.`;
+  }
+
+  #period(arg, fallback) {
+    if (!arg) return fallback;
+    const period = arg.toLowerCase();
+    if (!Object.hasOwn(PERIODS, period)) throw new UserError(`Pick a period: ${Object.keys(PERIODS).join(', ')}.`);
+    return period;
+  }
+
+  /** One page of a long list (`page` starts at 1). */
+  #pageEmbed(title, lines, page, footer) {
+    const pages = Math.max(1, Math.ceil(lines.length / LIST_PAGE_SIZE));
+    const p = Math.min(Math.max(1, page ?? 1), pages) - 1;
+    const body = lines.slice(p * LIST_PAGE_SIZE, (p + 1) * LIST_PAGE_SIZE).join('\n');
+    const result = new EmbedBuilder().setColor(COLORS.idle).setTitle(title).setDescription(body.slice(0, 4000) || '*Empty.*');
+    const footerText = [pages > 1 ? `Page ${p + 1}/${pages}` : null, footer].filter(Boolean).join(' · ');
+    if (footerText) result.setFooter({ text: footerText });
+    return result;
+  }
+
+  /** Joins the member's channel and queues saved songs (playlist or liked songs). */
+  async #playSaved(ctx, stored, shuffle) {
+    const denied = this.#deny(ctx.member);
+    if (denied) throw new UserError(denied);
+    await this.voice.ensureFor(ctx.member);
+    this.session.textChannelId = ctx.message.channelId;
+    const tracks = toTracks(stored, ctx.member.user);
+    if (shuffle) shuffleInPlace(tracks);
+    return this.#enqueue(ctx, tracks);
+  }
+
+  /** Starts (ms > 0) or cancels (ms = 0) the sleep timer. When it ends: stop, clear the queue, leave voice. */
+  #setSleep(ms, channel) {
+    clearTimeout(this.#sleepTimer);
+    this.#sleepTimer = null;
+    this.session.sleepAt = ms ? Date.now() + ms : null;
+    this.session.emit('change');
+    if (!ms) return;
+    this.#sleepTimer = setTimeout(() => {
+      this.#sleepTimer = null;
+      this.session.sleepAt = null;
+      const wasPlaying = Boolean(this.session.nowPlaying || this.session.hasPending);
+      this.session.stop();
+      this.voice.leave();
+      log.info('Sleep timer ended: stopped and left voice.');
+      if (wasPlaying) channel?.send({ embeds: [embed('😴 Sleep timer ended. Stopped the music and left voice. Good night!')] }).catch(() => {});
+    }, ms);
   }
 
   #linkChannels() {
@@ -638,6 +727,224 @@ export class CommandHandler {
         },
       },
       {
+        name: 'sleep',
+        aliases: ['timer'],
+        usage: 'sleep <30m | 1h | 1h30m | off>',
+        description: 'Stop the music and leave voice after a while. With nothing after it, shows the time left.',
+        sameChannel: true,
+        run: (ctx) => {
+          const arg = ctx.argText.toLowerCase();
+          if (!arg) {
+            if (!s.sleepAt) return ctx.reply(`😴 No sleep timer. Try \`${config.prefix}sleep 30m\`.`);
+            return ctx.reply(`😴 Stopping in **${formatListening((s.sleepAt - Date.now()) / 1000)}**. \`${config.prefix}sleep off\` cancels.`);
+          }
+          if (['off', 'cancel', 'stop', '0'].includes(arg)) {
+            if (!s.sleepAt) throw new UserError('No sleep timer is running.');
+            this.#setSleep(0);
+            return ctx.reply('⏰ Sleep timer cancelled.');
+          }
+          const minutes = parseMinutes(arg);
+          if (!minutes || minutes < 1 || minutes > MAX_SLEEP_MIN) {
+            throw new UserError(`Usage: \`${config.prefix}sleep 30m\`, \`${config.prefix}sleep 1h30m\` (1 min to 12 h) or \`${config.prefix}sleep off\`.`);
+          }
+          this.#setSleep(Math.round(minutes * 60_000), ctx.message.channel);
+          const at = Math.floor((Date.now() + minutes * 60_000) / 1000);
+          return ctx.reply(`😴 Sleep timer set: the music stops <t:${at}:R> (at <t:${at}:t>).`, COLORS.paused);
+        },
+      },
+      {
+        name: 'like',
+        aliases: ['love', 'fav'],
+        usage: 'like',
+        description: 'Add the current song to your liked songs (or remove it). The ❤️ button does the same.',
+        anytime: true,
+        run: (ctx) => {
+          const track = s.nowPlaying;
+          if (!track) throw new UserError('Nothing is playing.');
+          return ctx.reply(this.#toggleLike(ctx.member.id, track), COLORS.playing);
+        },
+      },
+      {
+        name: 'liked',
+        aliases: ['likes', 'favs'],
+        usage: 'liked [play | shuffle | page]',
+        description: 'Show your liked songs. `liked play` queues them all, `liked shuffle` in random order.',
+        anytime: true,
+        run: async (ctx) => {
+          const list = this.library.liked(ctx.member.id);
+          const arg = ctx.args[0]?.toLowerCase();
+          if (arg === 'play' || arg === 'shuffle') {
+            if (!list.length) throw new UserError('You have no liked songs yet. Press ❤️ on the player.');
+            return this.#playSaved(ctx, list, arg === 'shuffle');
+          }
+          const lines = list.map((t, i) => `\`${i + 1}.\` ${trackLabel(t, 60)} \`${formatDuration(t.duration)}\``);
+          const total = list.reduce((sum, t) => sum + (t.duration ?? 0), 0);
+          return ctx.reply(
+            this.#pageEmbed(
+              `❤️ ${ctx.member.displayName}'s liked songs`,
+              lines.length ? lines : ['*None yet. Press ❤️ on the player to like a song.*'],
+              parsePositive(ctx.args[0]),
+              list.length ? `${list.length} song(s) · ${formatListening(total)} · ${config.prefix}liked play` : null,
+            ),
+          );
+        },
+      },
+      {
+        name: 'save',
+        aliases: ['savepl'],
+        usage: 'save <playlist name>',
+        description: 'Save the current song and Up Next as a playlist (autoplay picks are left out). Same name replaces it.',
+        anytime: true,
+        run: (ctx) => {
+          if (!ctx.argText) throw new UserError(`Usage: \`${config.prefix}save <playlist name>\``);
+          const tracks = s.tracks.slice(s.index).filter((t, i) => i === 0 || !t.autoplay);
+          if (!tracks.length) throw new UserError('The queue is empty; play something first.');
+          const isOwner = ctx.member.id === config.ownerId;
+          const { replaced, count, cut } = this.library.savePlaylist(ctx.argText, tracks, ctx.member.id, isOwner);
+          const name = this.library.playlist(ctx.argText).name;
+          return ctx.reply(
+            `💾 ${replaced ? 'Updated' : 'Saved'} **${name}** with ${count} song(s)${cut ? ' (the limit is 500)' : ''}. Play it with \`${config.prefix}load ${name}\`.`,
+            COLORS.playing,
+          );
+        },
+      },
+      {
+        name: 'load',
+        aliases: ['loadpl'],
+        usage: 'load <playlist name> [shuffle]',
+        description: 'Queue a saved playlist. Add `shuffle` for random order.',
+        run: async (ctx) => {
+          if (!ctx.argText) throw new UserError(`Usage: \`${config.prefix}load <playlist name>\`. See \`${config.prefix}playlists\`.`);
+          // A playlist literally named "... shuffle" wins over the shuffle option.
+          const exact = this.library.playlist(ctx.argText);
+          const { name, shuffle } = exact ? { name: ctx.argText, shuffle: false } : nameAndShuffle(ctx.argText);
+          const playlist = exact ?? this.library.playlist(name);
+          if (!playlist) throw new UserError(`No playlist called **${cleanTitle(name, 32)}**. See \`${config.prefix}playlists\`.`);
+          return this.#playSaved(ctx, playlist.tracks, shuffle);
+        },
+      },
+      {
+        name: 'playlists',
+        aliases: ['pls'],
+        usage: 'playlists [name]',
+        description: 'List saved playlists, or the songs in one.',
+        anytime: true,
+        run: (ctx) => {
+          // "cplaylists 2" = page 2 of the list; "cplaylists gym 2" = page 2 of "gym" (unless "gym 2" exists).
+          const exact = ctx.argText && this.library.playlist(ctx.argText);
+          const m = ctx.argText.match(/^(.*?)\s*(\d+)?$/);
+          const name = exact ? ctx.argText : m[1].trim();
+          const page = exact ? 1 : parsePositive(m[2]);
+          if (name) {
+            const playlist = exact || this.library.playlist(name);
+            if (!playlist) throw new UserError(`No playlist called **${cleanTitle(name, 32)}**.`);
+            const lines = playlist.tracks.map((t, i) => `\`${i + 1}.\` ${trackLabel(t, 60)} \`${formatDuration(t.duration)}\``);
+            const total = playlist.tracks.reduce((sum, t) => sum + (t.duration ?? 0), 0);
+            return ctx.reply(
+              this.#pageEmbed(
+                `💾 ${playlist.name}`,
+                [`By <@${playlist.by}> · updated ${timeAgo(playlist.updatedAt)}`, '', ...lines],
+                page,
+                `${playlist.tracks.length} song(s) · ${formatListening(total)} · ${config.prefix}load ${playlist.name}`,
+              ),
+            );
+          }
+          const all = this.library.playlists();
+          const lines = all.map((p) => `💾 **${cleanTitle(p.name, 32)}** · ${p.tracks.length} song(s) · <@${p.by}> · ${timeAgo(p.updatedAt)}`);
+          return ctx.reply(
+            this.#pageEmbed(
+              '💾 Playlists',
+              lines.length ? lines : [`*None yet. Queue some songs, then \`${config.prefix}save <name>\`.*`],
+              page,
+              all.length ? `${config.prefix}load <name> · ${config.prefix}playlists <name> shows the songs` : null,
+            ),
+          );
+        },
+      },
+      {
+        name: 'delpl',
+        aliases: ['deleteplaylist', 'unsave'],
+        usage: 'delpl <playlist name>',
+        description: 'Delete a saved playlist (its creator or the owner).',
+        anytime: true,
+        run: (ctx) => {
+          if (!ctx.argText) throw new UserError(`Usage: \`${config.prefix}delpl <playlist name>\``);
+          const name = this.library.deletePlaylist(ctx.argText, ctx.member.id, ctx.member.id === config.ownerId);
+          return ctx.reply(`🗑 Deleted playlist **${name}**.`);
+        },
+      },
+      {
+        name: 'history',
+        aliases: ['hist', 'recent'],
+        usage: 'history [page]',
+        description: 'Songs played recently (heard for at least 30 s).',
+        anytime: true,
+        run: (ctx) => {
+          const recent = this.stats.recent(150);
+          const lines = recent.map(({ track, at }, i) => `\`${i + 1}.\` ${trackLabel(track, 55)} · ${timeAgo(at)}`);
+          return ctx.reply(this.#pageEmbed('🕘 Recently played', lines.length ? lines : ['*Nothing yet.*'], parsePositive(ctx.args[0])));
+        },
+      },
+      {
+        name: 'top',
+        aliases: ['mostplayed'],
+        usage: 'top [today | week | month | year | all]',
+        description: 'Most played songs and artists (all time unless you pick a period).',
+        anytime: true,
+        run: (ctx) => {
+          const period = this.#period(ctx.args[0], 'all');
+          const sum = this.stats.summary(PERIODS[period]);
+          if (!sum.plays) return ctx.reply(`📊 No plays in ${PERIOD_LABELS[period]} yet.`);
+          const songs = sum.songs
+            .slice(0, 10)
+            .map((x, i) => `\`${i + 1}.\` ${trackLabel(x.track, 50)} · **${x.count}** play${x.count === 1 ? '' : 's'}`);
+          const artists = sum.artists.slice(0, 5).map((x, i) => `\`${i + 1}.\` ${cleanTitle(x.name, 40)} · **${x.count}** · ${formatListening(x.seconds)}`);
+          const result = new EmbedBuilder()
+            .setColor(COLORS.idle)
+            .setTitle(`📊 Top · ${PERIOD_LABELS[period]}`)
+            .setDescription(`**Songs**\n${songs.join('\n')}${artists.length ? `\n\n**Artists**\n${artists.join('\n')}` : ''}`.slice(0, 4000))
+            .setFooter({ text: `${sum.plays} plays · ${sum.unique} songs · ${formatListening(sum.seconds)} listened` });
+          return ctx.reply(result);
+        },
+      },
+      {
+        name: 'wrapped',
+        aliases: ['stats'],
+        usage: 'wrapped [today | week | month | year | all]',
+        description: 'Your listening summary: time, plays, top songs, artists and languages (last 30 days by default).',
+        anytime: true,
+        run: (ctx) => {
+          const period = this.#period(ctx.args[0], 'month');
+          const sum = this.stats.summary(PERIODS[period]);
+          if (!sum.plays) return ctx.reply(`🎁 No plays in ${PERIOD_LABELS[period]} yet.`);
+          const top = sum.songs[0];
+          const langTotal = sum.languages.reduce((n, l) => n + l.count, 0);
+          const langs = sum.languages
+            .slice(0, 3)
+            .map((l) => `${l.name} ${Math.round((l.count / langTotal) * 100)}%`)
+            .join(' · ');
+          const lines = [
+            `⏱ **${formatListening(sum.seconds)}** listened · **${sum.plays}** plays · **${sum.unique}** different songs`,
+            '',
+            `🏆 **Song of the period:** ${trackLabel(top.track, 60)} (${top.count}×)`,
+            ...(sum.artists[0] ? [`🎤 **Top artist:** ${cleanTitle(sum.artists[0].name, 40)} (${formatListening(sum.artists[0].seconds)})`] : []),
+            ...(langs ? [`🌐 **Languages:** ${langs}`] : []),
+            '',
+            '**Top 5 songs**',
+            ...sum.songs.slice(0, 5).map((x, i) => `\`${i + 1}.\` ${trackLabel(x.track, 50)} · ${x.count}×`),
+            ...(sum.artists.length
+              ? ['', '**Top 5 artists**', ...sum.artists.slice(0, 5).map((x, i) => `\`${i + 1}.\` ${cleanTitle(x.name, 40)} · ${x.count} plays`)]
+              : []),
+          ];
+          const result = new EmbedBuilder()
+            .setColor(COLORS.playing)
+            .setTitle(`🎁 Wrapped · ${PERIOD_LABELS[period]}`)
+            .setDescription(lines.join('\n').slice(0, 4000))
+            .setFooter({ text: sum.since ? `Since ${new Date(sum.since).toLocaleDateString('en-GB')} · ${config.prefix}top for more` : `${config.prefix}top for more` });
+          return ctx.reply(result);
+        },
+      },
+      {
         name: 'follow',
         usage: 'follow [on | off]',
         description: 'Turn shadow mode on or off (the bot follows you between voice channels).',
@@ -729,7 +1036,7 @@ export class CommandHandler {
         aliases: ['commands'],
         usage: 'help',
         description: 'Show all commands.',
-        run: (ctx) => {
+        run: async (ctx) => {
           const isOwner = ctx.member.id === config.ownerId;
           const lines = this.#definitions()
             .filter((c) => isOwner || !c.ownerOnly)
@@ -737,12 +1044,19 @@ export class CommandHandler {
               const aliases = c.aliases?.length ? ` *(${c.aliases.map((a) => config.prefix + a).join(', ')})*` : '';
               return `\`${config.prefix}${c.usage}\`${aliases}\n${c.description}`;
             });
-          const help = new EmbedBuilder()
-            .setColor(COLORS.idle)
-            .setTitle('🎧 Commands')
-            .setDescription(lines.join('\n\n').slice(0, 4000))
-            .setFooter({ text: 'While the owner is in voice, only the owner can control the bot.' });
-          return ctx.reply(help);
+          // Discord allows 4096 characters per embed, so long help is split over several messages.
+          const chunks = [''];
+          for (const line of lines) {
+            if (chunks.at(-1).length + line.length + 2 > 3900) chunks.push('');
+            chunks[chunks.length - 1] += `${chunks.at(-1) ? '\n\n' : ''}${line}`;
+          }
+          for (const [i, text] of chunks.entries()) {
+            const help = new EmbedBuilder().setColor(COLORS.idle).setDescription(text);
+            if (i === 0) help.setTitle('🎧 Commands');
+            if (i === chunks.length - 1) help.setFooter({ text: 'While the owner is in voice, only the owner can control playback.' });
+            if (i === 0) await ctx.reply(help);
+            else await ctx.message.channel.send({ embeds: [help] }).catch(() => {});
+          }
         },
       },
     ];
